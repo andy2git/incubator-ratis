@@ -314,6 +314,15 @@ public abstract class RaftLog implements RaftLogSequentialOps, Closeable {
 
   abstract CompletableFuture<Long> truncateImpl(long index);
 
+
+  @Override
+  public final CompletableFuture<Long> purge(long index) {
+    return runner.runSequentially(() -> purgeImpl(index));
+  }
+
+  abstract CompletableFuture<Long> purgeImpl(long index);
+
+
   @Override
   public final CompletableFuture<Long> appendEntry(LogEntryProto entry) {
     return runner.runSequentially(() -> appendEntryImpl(entry));

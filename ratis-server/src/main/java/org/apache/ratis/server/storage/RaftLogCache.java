@@ -238,6 +238,27 @@ class RaftLogCache {
       }
     }
 
+    TruncationSegments purge(long index) {
+      int segmentIndex = binarySearch(index);
+      List<SegmentFileInfo> list = new ArrayList<>();
+
+      if (segmentIndex == -segments.size() - 1) {
+        for (LogSegment ls : segments) {
+          list.add(new SegmentFileInfo(ls.getStartIndex(), ls.getEndIndex(), false, 0, 0));
+        }
+        segments.clear();
+      } else if (segmentIndex >= 0) {
+        // we start to purge the closedSegments which do not overlap with index.
+        for (int i = segmentIndex - 1; i >= 0; i--) {
+          LogSegment ls = segments.get(i);
+          list.add(new SegmentFileInfo(ls.getStartIndex(), ls.getEndIndex(), false, 0, 0));
+          segments.remove(i);
+        }
+      }
+      if (list.isEmpty()) return null;
+      else return new TruncationSegments(null, list);
+    }
+
     static SegmentFileInfo deleteOpenSegment(LogSegment openSegment, Runnable clearOpenSegment) {
       final long oldEnd = openSegment.getEndIndex();
       openSegment.clear();
@@ -430,6 +451,10 @@ class RaftLogCache {
    */
   TruncationSegments truncate(long index) {
     return closedSegments.truncate(index, openSegment, this::clearOpenSegment);
+  }
+
+  TruncationSegments purge(long index) {
+    return closedSegments.purge(index);
   }
 
   Iterator<TermIndex> iterator(long startIndex) {

@@ -134,4 +134,11 @@ interface RaftLogSequentialOps {
    * Used by the leader and the followers.
    */
   CompletableFuture<Long> truncate(long index);
+
+  /**
+   * Purge asynchronously delete the segment files which does not overlap with the given index.
+   * Open segment will not be considered for purging.
+   * @param index - is inclusive.
+   */
+  CompletableFuture<Long> purge(long index);
 }
