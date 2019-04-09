@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -25,20 +25,21 @@ import java.util.concurrent.TimeUnit;
  * Policy abstract for retrying.
  */
 public interface RetryPolicy {
+  TimeDuration ZERO_MILLIS = TimeDuration.valueOf(0, TimeUnit.MILLISECONDS);
 
   /**
    * Determines whether it is supposed to retry the connection if the operation
    * fails for some reason.
    *
-   * @param retryCount The number of times retried so far
+   * @param attemptCount The number of times attempted so far
    * @return true if it has to make another attempt, otherwise, false
    */
-  boolean shouldRetry(int retryCount);
+  boolean shouldRetry(int attemptCount);
 
   /**
    * Returns the time duration for sleep in between the retries.
    */
   default TimeDuration getSleepTime() {
-    return TimeDuration.valueOf(0, TimeUnit.MILLISECONDS);
+    return ZERO_MILLIS;
   }
 }

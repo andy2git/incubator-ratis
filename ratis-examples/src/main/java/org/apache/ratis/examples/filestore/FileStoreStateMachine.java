@@ -19,6 +19,7 @@ package org.apache.ratis.examples.filestore;
 
 import org.apache.ratis.conf.ConfUtils;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.proto.ExamplesProtos;
 import org.apache.ratis.proto.ExamplesProtos.DeleteReplyProto;
 import org.apache.ratis.proto.ExamplesProtos.DeleteRequestProto;
 import org.apache.ratis.proto.ExamplesProtos.FileStoreRequestProto;
@@ -31,13 +32,11 @@ import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.server.RaftServer;
-import org.apache.ratis.server.impl.ServerProtoUtils;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
-import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.com.google.protobuf.InvalidProtocolBufferException;
 import org.apache.ratis.util.FileUtils;
@@ -95,17 +94,19 @@ public class FileStoreStateMachine extends BaseStateMachine {
   public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
     final ByteString content = request.getMessage().getContent();
     final FileStoreRequestProto proto = FileStoreRequestProto.parseFrom(content);
-    final StateMachineLogEntryProto log;
+    final TransactionContext.Builder b = TransactionContext.newBuilder()
+        .setStateMachine(this)
+        .setClientRequest(request);
+
     if (proto.getRequestCase() == FileStoreRequestProto.RequestCase.WRITE) {
       final WriteRequestProto write = proto.getWrite();
       final FileStoreRequestProto newProto = FileStoreRequestProto.newBuilder()
           .setWriteHeader(write.getHeader()).build();
-      log = ServerProtoUtils.toStateMachineLogEntryProto(request, newProto.toByteString(), write.getData());
+      b.setLogData(newProto.toByteString()).setStateMachineData(write.getData());
     } else {
-      log = ServerProtoUtils.toStateMachineLogEntryProto(request, content, null);
+      b.setLogData(content);
     }
-
-    return new TransactionContextImpl(this, request, log);
+    return b.build();
   }
 
   @Override
@@ -128,6 +129,28 @@ public class FileStoreStateMachine extends BaseStateMachine {
         h.getPath().toStringUtf8(), h.getClose(), h.getOffset(), smLog.getStateMachineEntry().getStateMachineData());
     // sync only if closing the file
     return h.getClose()? f: null;
+  }
+
+  @Override
+  public CompletableFuture<ByteString> readStateMachineData(LogEntryProto entry) {
+    final StateMachineLogEntryProto smLog = entry.getStateMachineLogEntry();
+    final ByteString data = smLog.getLogData();
+    final FileStoreRequestProto proto;
+    try {
+      proto = FileStoreRequestProto.parseFrom(data);
+    } catch (InvalidProtocolBufferException e) {
+      return FileStoreCommon.completeExceptionally(
+          entry.getIndex(), "Failed to parse data, entry=" + entry, e);
+    }
+    if (proto.getRequestCase() != FileStoreRequestProto.RequestCase.WRITEHEADER) {
+      return null;
+    }
+
+    final WriteRequestHeaderProto h = proto.getWriteHeader();
+    CompletableFuture<ExamplesProtos.ReadReplyProto> reply =
+        files.read(h.getPath().toStringUtf8(), h.getOffset(), h.getLength());
+
+    return reply.thenApply(ExamplesProtos.ReadReplyProto::getData);
   }
 
   @Override

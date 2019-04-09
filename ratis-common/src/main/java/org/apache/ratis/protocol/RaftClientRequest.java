@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,6 +19,7 @@ package org.apache.ratis.protocol;
 
 import org.apache.ratis.proto.RaftProtos.*;
 import org.apache.ratis.util.Preconditions;
+import org.apache.ratis.util.ProtoUtils;
 
 import java.util.Objects;
 
@@ -29,19 +30,12 @@ import static org.apache.ratis.proto.RaftProtos.RaftClientRequestProto.TypeCase.
  */
 public class RaftClientRequest extends RaftClientMessage {
   private static final Type WRITE_DEFAULT = new Type(WriteRequestTypeProto.getDefaultInstance());
-  private static final Type WRITE_ALL = new Type(
-      WriteRequestTypeProto.newBuilder().setReplication(ReplicationLevel.ALL).build());
 
   private static final Type DEFAULT_READ = new Type(ReadRequestTypeProto.getDefaultInstance());
   private static final Type DEFAULT_STALE_READ = new Type(StaleReadRequestTypeProto.getDefaultInstance());
 
-  public static Type writeRequestType(ReplicationLevel replication) {
-    switch (replication) {
-      case MAJORITY: return WRITE_DEFAULT;
-      case ALL: return WRITE_ALL;
-      default:
-        throw new IllegalArgumentException("Unexpected replication: " + replication);
-    }
+  public static Type writeRequestType() {
+    return WRITE_DEFAULT;
   }
 
   public static Type readRequestType() {
@@ -60,7 +54,7 @@ public class RaftClientRequest extends RaftClientMessage {
   /** The type of a request (oneof write, read, staleRead, watch; see the message RaftClientRequestProto). */
   public static class Type {
     public static Type valueOf(WriteRequestTypeProto write) {
-      return writeRequestType(write.getReplication());
+      return WRITE_DEFAULT;
     }
 
     public static Type valueOf(ReadRequestTypeProto read) {
@@ -145,7 +139,7 @@ public class RaftClientRequest extends RaftClientMessage {
     public String toString() {
       switch (typeCase) {
         case WRITE:
-          return "RW" + toString(getWrite().getReplication());
+          return "RW";
         case READ:
           return "RO";
         case STALEREAD:
@@ -159,24 +153,23 @@ public class RaftClientRequest extends RaftClientMessage {
   }
 
   private final long callId;
-  private final long seqNum;
-
   private final Message message;
   private final Type type;
 
-  public RaftClientRequest(ClientId clientId, RaftPeerId serverId,
-      RaftGroupId groupId, long callId) {
-    this(clientId, serverId, groupId, callId, 0L, null, WRITE_DEFAULT);
+  private final SlidingWindowEntry slidingWindowEntry;
+
+  RaftClientRequest(ClientId clientId, RaftPeerId serverId, RaftGroupId groupId, long callId, Type type) {
+    this(clientId, serverId, groupId, callId, null, type, null);
   }
 
   public RaftClientRequest(
       ClientId clientId, RaftPeerId serverId, RaftGroupId groupId,
-      long callId, long seqNum, Message message, Type type) {
+      long callId, Message message, Type type, SlidingWindowEntry slidingWindowEntry) {
     super(clientId, serverId, groupId);
     this.callId = callId;
-    this.seqNum = seqNum;
     this.message = message;
     this.type = type;
+    this.slidingWindowEntry = slidingWindowEntry != null? slidingWindowEntry: SlidingWindowEntry.getDefaultInstance();
   }
 
   @Override
@@ -188,8 +181,8 @@ public class RaftClientRequest extends RaftClientMessage {
     return callId;
   }
 
-  public long getSeqNum() {
-    return seqNum;
+  public SlidingWindowEntry getSlidingWindowEntry() {
+    return slidingWindowEntry;
   }
 
   public Message getMessage() {
@@ -206,7 +199,7 @@ public class RaftClientRequest extends RaftClientMessage {
 
   @Override
   public String toString() {
-    return super.toString() + ", cid=" + callId + ", seq=" + seqNum + " "
+    return super.toString() + ", cid=" + callId + ", seq=" + ProtoUtils.toString(slidingWindowEntry) + ", "
         + type + ", " + getMessage();
   }
 }

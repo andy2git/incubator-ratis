@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -51,6 +51,7 @@ public class GrpcLogAppender extends LogAppender {
   private final int maxPendingRequestsNum;
   private long callId = 0;
   private volatile boolean firstResponseReceived = false;
+  private final boolean installSnapshotEnabled;
 
   private final TimeDuration requestTimeoutDuration;
   private final TimeoutScheduler scheduler = TimeoutScheduler.newInstance(1);
@@ -67,6 +68,8 @@ public class GrpcLogAppender extends LogAppender {
         server.getProxy().getProperties());
     requestTimeoutDuration = RaftServerConfigKeys.Rpc.requestTimeout(server.getProxy().getProperties());
     pendingRequests = new ConcurrentHashMap<>();
+    installSnapshotEnabled = GrpcConfigKeys.LogAppender.installSnapshotEnabled(
+        server.getProxy().getProperties());
   }
 
   private GrpcServerProtocolClient getClient() throws IOException {
@@ -86,12 +89,18 @@ public class GrpcLogAppender extends LogAppender {
 
   @Override
   protected void runAppenderImpl() throws IOException {
+    boolean shouldAppendLog;
     for(; isAppenderRunning(); mayWait()) {
+      shouldAppendLog = true;
       if (shouldSendRequest()) {
-        SnapshotInfo snapshot = shouldInstallSnapshot();
-        if (snapshot != null) {
-          installSnapshot(snapshot);
-        } else if (!shouldWait()) {
+        if (installSnapshotEnabled) {
+          SnapshotInfo snapshot = shouldInstallSnapshot();
+          if (snapshot != null) {
+            installSnapshot(snapshot);
+            shouldAppendLog = false;
+          }
+        }
+        if (shouldAppendLog && !shouldWait()) {
           // keep appending log entries or sending heartbeats
           appendLog();
         }
@@ -180,7 +189,7 @@ public class GrpcLogAppender extends LogAppender {
   private void timeoutAppendRequest(AppendEntriesRequestProto request) {
     AppendEntriesRequestProto pendingRequest = pendingRequests.remove(request.getServerRequest().getCallId());
     if (pendingRequest != null) {
-      LOG.warn( "{}: appendEntries Timeout, request={}", this, ProtoUtils.toString(pendingRequest.getServerRequest()));
+      LOG.warn( "{}: appendEntries Timeout, request={}", this, ServerProtoUtils.toString(pendingRequest));
     }
   }
 
@@ -206,10 +215,19 @@ public class GrpcLogAppender extends LogAppender {
      */
     @Override
     public void onNext(AppendEntriesReplyProto reply) {
-      LOG.debug("{} received {} response from {}", server.getId(),
-          (!firstResponseReceived ? "the first" : "a"),
-          follower.getPeer());
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("{}<-{}: received {} reply {} ", server.getId(), follower.getPeer(),
+            (!firstResponseReceived? "the first": "a"), ServerProtoUtils.toString(reply));
+      }
 
+      try {
+        onNextImpl(reply);
+      } catch(Throwable t) {
+        LOG.error("Failed onNext " + reply, t);
+      }
+    }
+
+    private void onNextImpl(AppendEntriesReplyProto reply) {
       // update the last rpc time
       follower.updateLastRpcResponseTime();
 
@@ -249,8 +267,8 @@ public class GrpcLogAppender extends LogAppender {
 
     @Override
     public void onCompleted() {
-      LOG.info("{} stops appending log entries to follower {}", server.getId(),
-          follower);
+      LOG.info("{}: follower {} response Completed", server.getId(), follower);
+      resetClient(null);
     }
   }
 
@@ -428,8 +446,7 @@ public class GrpcLogAppender extends LogAppender {
     }
 
     if (responseHandler.hasAllResponse()) {
-      follower.updateMatchIndex(snapshot.getTermIndex().getIndex());
-      follower.updateNextIndex(snapshot.getTermIndex().getIndex() + 1);
+      follower.setSnapshotIndex(snapshot.getTermIndex().getIndex());
       LOG.info("{}: install snapshot-{} successfully on follower {}",
           server.getId(), snapshot.getTermIndex().getIndex(), follower.getPeer());
     }

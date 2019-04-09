@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,9 +19,11 @@ package org.apache.ratis;
 
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
+import org.apache.ratis.proto.RaftProtos.LogEntryProto.LogEntryBodyCase;
 import org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
@@ -33,10 +35,13 @@ import org.apache.ratis.server.impl.ServerProtoUtils;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.storage.RaftLog;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.util.AutoCloseableLock;
+import org.apache.ratis.util.CollectionUtils;
 import org.apache.ratis.util.JavaUtils;
-import org.apache.ratis.util.Preconditions;
 import org.apache.ratis.util.ProtoUtils;
+import org.apache.ratis.util.TimeDuration;
 import org.junit.Assert;
+import org.junit.AssumptionViolatedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,10 +49,17 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
 
@@ -57,60 +69,54 @@ public interface RaftTestUtil {
 
   static RaftServerImpl waitForLeader(MiniRaftCluster cluster)
       throws InterruptedException {
-    return waitForLeader(cluster, false);
+    return waitForLeader(cluster, null);
   }
 
-  static RaftServerImpl waitForLeader(
-      MiniRaftCluster cluster, boolean tolerateMultipleLeaders) throws InterruptedException {
-    return waitForLeader(cluster, tolerateMultipleLeaders, null);
-  }
-
-  static RaftServerImpl waitForLeader(
-      MiniRaftCluster cluster, boolean tolerateMultipleLeaders, RaftGroupId groupId)
+  static RaftServerImpl waitForLeader(MiniRaftCluster cluster, RaftGroupId groupId)
       throws InterruptedException {
-    final long sleepTime = (cluster.getMaxTimeout() * 3) >> 1;
+    return waitForLeader(cluster, groupId, true);
+  }
+
+  static RaftServerImpl waitForLeader(
+      MiniRaftCluster cluster, RaftGroupId groupId, boolean expectLeader)
+      throws InterruptedException {
+    final String name = "waitForLeader-" + groupId + "-(expectLeader? " + expectLeader + ")";
+    final int numAttempts = expectLeader? 100: 10;
+    final TimeDuration sleepTime = cluster.getTimeoutMax().apply(d -> (d * 3) >> 1);
     LOG.info(cluster.printServers(groupId));
-    RaftServerImpl leader = null;
-    for(int i = 0; leader == null && i < 10; i++) {
-      Thread.sleep(sleepTime);
-      try {
-        leader = cluster.getLeader(groupId);
-      } catch(IllegalStateException e) {
-        if (!tolerateMultipleLeaders) {
-          throw e;
-        }
+
+    final AtomicReference<IllegalStateException> exception = new AtomicReference<>();
+    final Runnable handleNoLeaders = () -> {
+      throw cluster.newIllegalStateExceptionForNoLeaders(groupId);
+    };
+    final Consumer<List<RaftServerImpl>> handleMultipleLeaders = leaders -> {
+      final IllegalStateException ise = cluster.newIllegalStateExceptionForMultipleLeaders(groupId, leaders);
+      exception.set(ise);
+    };
+
+    final RaftServerImpl leader = JavaUtils.attempt(
+        () -> cluster.getLeader(groupId, handleNoLeaders, handleMultipleLeaders),
+        numAttempts, sleepTime, name, LOG);
+
+    LOG.info(cluster.printServers(groupId));
+    if (expectLeader) {
+      return Optional.ofNullable(leader).orElseThrow(exception::get);
+    } else {
+      if (leader == null) {
+        return null;
+      } else {
+        throw new IllegalStateException("expectLeader = " + expectLeader + " but leader = " + leader);
       }
     }
-    LOG.info(cluster.printServers(groupId));
-    return leader;
   }
 
-  static RaftServerImpl waitForLeader(
-      MiniRaftCluster cluster, final String leaderId) throws InterruptedException {
-    LOG.info(cluster.printServers());
-    for(int i = 0; !cluster.tryEnforceLeader(leaderId) && i < 10; i++) {
-      RaftServerImpl currLeader = cluster.getLeader();
-      LOG.info("try enforcing leader to " + leaderId + " but " +
-          (currLeader == null ? "no leader for this round" : "new leader is " + currLeader.getId()));
-    }
-    LOG.info(cluster.printServers());
-
-    final RaftServerImpl leader = cluster.getLeader();
-    Assert.assertEquals(leaderId, leader.getId().toString());
-    return leader;
-  }
-
-  static String waitAndKillLeader(MiniRaftCluster cluster,
-      boolean expectLeader) throws InterruptedException {
+  static RaftPeerId waitAndKillLeader(MiniRaftCluster cluster) throws InterruptedException {
     final RaftServerImpl leader = waitForLeader(cluster);
-    if (!expectLeader) {
-      Assert.assertNull(leader);
-    } else {
-      Assert.assertNotNull(leader);
-      LOG.info("killing leader = " + leader);
-      cluster.killServer(leader.getId());
-    }
-    return leader != null ? leader.getId().toString() : null;
+    Assert.assertNotNull(leader);
+
+    LOG.info("killing leader = " + leader);
+    cluster.killServer(leader.getId());
+    return leader.getId();
   }
 
   static boolean logEntriesContains(RaftLog log, SimpleMessage... expectedMessages) {
@@ -155,11 +161,17 @@ public interface RaftTestUtil {
     }
   }
 
-  static void assertLogEntries(MiniRaftCluster cluster, SimpleMessage... expectedMessages) {
+  static void assertLogEntries(MiniRaftCluster cluster, SimpleMessage[] expectedMessages) {
+    for(SimpleMessage m : expectedMessages) {
+      assertLogEntries(cluster, m);
+    }
+  }
+
+  static void assertLogEntries(MiniRaftCluster cluster, SimpleMessage expectedMessage) {
     final int size = cluster.getServers().size();
     final long count = cluster.getServerAliveStream()
         .map(s -> s.getState().getLog())
-        .filter(log -> logEntriesContains(log, expectedMessages))
+        .filter(log -> logEntriesContains(log, expectedMessage))
         .count();
     if (2*count <= size) {
       throw new AssertionError("Not in majority: size=" + size
@@ -178,28 +190,36 @@ public interface RaftTestUtil {
     }
   }
 
-  static void assertLogEntries(RaftLog log, long expectedTerm, SimpleMessage... expectedMessages) {
-    final TermIndex[] termIndices = log.getEntries(1, Long.MAX_VALUE);
-    final List<LogEntryProto> entries = new ArrayList<>(expectedMessages.length);
-    for (TermIndex ti : termIndices) {
-      final LogEntryProto e;
+  static Iterable<LogEntryProto> getLogEntryProtos(RaftLog log) {
+    return CollectionUtils.as(log.getEntries(0, Long.MAX_VALUE), ti -> {
       try {
-        e = log.get(ti.getIndex());
+        return log.get(ti.getIndex());
       } catch (IOException exception) {
         throw new AssertionError("Failed to get log at " + ti, exception);
       }
+    });
+  }
 
+  static List<LogEntryProto> getStateMachineLogEntries(RaftLog log) {
+    final List<LogEntryProto> entries = new ArrayList<>();
+    for (LogEntryProto e : getLogEntryProtos(log)) {
+      final String s = ServerProtoUtils.toString(e);
       if (e.hasStateMachineLogEntry()) {
-        LOG.info(ServerProtoUtils.toString(e) + ", " + e.getStateMachineLogEntry().toString().trim().replace("\n", ", "));
+        LOG.info(s + ", " + e.getStateMachineLogEntry().toString().trim().replace("\n", ", "));
         entries.add(e);
       } else if (e.hasConfigurationEntry()) {
-        LOG.info("Found ConfigurationEntry at {}, ignoring it.", ti);
+        LOG.info("Found {}, ignoring it.", s);
+      } else if (e.hasMetadataEntry()) {
+        LOG.info("Found {}, ignoring it.", s);
       } else {
-        throw new AssertionError("Unexpected LogEntryBodyCase " + e.getLogEntryBodyCase() + " at " + ti
-            + ": " + ServerProtoUtils.toString(e));
+        throw new AssertionError("Unexpected LogEntryBodyCase " + e.getLogEntryBodyCase() + " at " + s);
       }
     }
+    return entries;
+  }
 
+  static void assertLogEntries(RaftLog log, long expectedTerm, SimpleMessage... expectedMessages) {
+    final List<LogEntryProto> entries = getStateMachineLogEntries(log);
     try {
       assertLogEntries(entries, expectedTerm, expectedMessages);
     } catch(Throwable t) {
@@ -330,16 +350,23 @@ public interface RaftTestUtil {
   }
 
   static RaftPeerId changeLeader(MiniRaftCluster cluster, RaftPeerId oldLeader)
-      throws InterruptedException {
+      throws Exception {
+    return changeLeader(cluster, oldLeader, AssumptionViolatedException::new);
+  }
+
+  static RaftPeerId changeLeader(MiniRaftCluster cluster, RaftPeerId oldLeader, Function<String, Exception> constructor)
+      throws Exception {
+    final String name = JavaUtils.getCallerStackTraceElement().getMethodName() + "-changeLeader";
     cluster.setBlockRequestsFrom(oldLeader.toString(), true);
     try {
       return JavaUtils.attempt(() -> {
         final RaftPeerId newLeader = waitForLeader(cluster).getId();
-        Preconditions.assertTrue(!newLeader.equals(oldLeader),
-            () -> "Failed to change leader: newLeader=" + newLeader + " equals oldLeader=" + oldLeader);
+        if (newLeader.equals(oldLeader)) {
+          throw constructor.apply("Failed to change leader: newLeader == oldLeader == " + oldLeader);
+        }
         LOG.info("Changed leader from " + oldLeader + " to " + newLeader);
         return newLeader;
-      }, 10, 100L, "changeLeader", LOG);
+      }, 20, BaseTest.HUNDRED_MILLIS, name, LOG);
     } finally {
       cluster.setBlockRequestsFrom(oldLeader.toString(), false);
     }
@@ -348,7 +375,7 @@ public interface RaftTestUtil {
   static <SERVER extends RaftServer> void blockQueueAndSetDelay(
       Collection<SERVER> servers,
       DelayLocalExecutionInjection injection, String leaderId, int delayMs,
-      long maxTimeout) throws InterruptedException {
+      TimeDuration maxTimeout) throws InterruptedException {
     // block reqeusts sent to leader if delayMs > 0
     final boolean block = delayMs > 0;
     LOG.debug("{} requests sent to leader {} and set {}ms delay for the others",
@@ -369,11 +396,10 @@ public interface RaftTestUtil {
           }
         });
 
-    Thread.sleep(3 * maxTimeout);
+    Thread.sleep(3 * maxTimeout.toLong(TimeUnit.MILLISECONDS));
   }
 
-  static void sendMessageInNewThread(MiniRaftCluster cluster, SimpleMessage... messages) {
-    RaftPeerId leaderId = cluster.getLeader().getId();
+  static void sendMessageInNewThread(MiniRaftCluster cluster, RaftPeerId leaderId, SimpleMessage... messages) {
     new Thread(() -> {
       try (final RaftClient client = cluster.createClient(leaderId)) {
         for (SimpleMessage mssg: messages) {
@@ -392,5 +418,36 @@ public interface RaftTestUtil {
     for(long i = 0; i < lastIndex; i++) {
       Assert.assertEquals(expected.get(i), computed.get(i));
     }
+  }
+
+  static EnumMap<LogEntryBodyCase, AtomicLong> countEntries(RaftLog raftLog) throws Exception {
+    final EnumMap<LogEntryBodyCase, AtomicLong> counts = new EnumMap<>(LogEntryBodyCase.class);
+    for(long i = 0; i < raftLog.getNextIndex(); i++) {
+      final LogEntryProto e = raftLog.get(i);
+      counts.computeIfAbsent(e.getLogEntryBodyCase(), c -> new AtomicLong()).incrementAndGet();
+    }
+    return counts;
+  }
+
+  static LogEntryProto getLastEntry(LogEntryBodyCase targetCase, RaftLog raftLog) throws Exception {
+    try(AutoCloseableLock readLock = raftLog.readLock()) {
+      long i = raftLog.getNextIndex() - 1;
+      for(; i >= 0; i--) {
+        final LogEntryProto entry = raftLog.get(i);
+        if (entry.getLogEntryBodyCase() == targetCase) {
+          return entry;
+        }
+      }
+    }
+    return null;
+  }
+
+  static void assertSuccessReply(CompletableFuture<RaftClientReply> reply) throws Exception {
+    assertSuccessReply(reply.get(10, TimeUnit.SECONDS));
+  }
+
+  static void assertSuccessReply(RaftClientReply reply) {
+    Assert.assertNotNull("reply == null", reply);
+    Assert.assertTrue("reply is not success: " + reply, reply.isSuccess());
   }
 }

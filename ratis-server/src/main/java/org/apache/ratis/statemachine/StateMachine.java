@@ -184,6 +184,18 @@ public interface StateMachine extends Closeable {
   TransactionContext applyTransactionSerial(TransactionContext trx);
 
   /**
+   * Called to notify state machine about indexes which are processed
+   * internally by Raft Server, this currently happens when conf entries are
+   * processed in raft Server. This keep state machine to keep a track of index
+   * updates.
+   * @param term term of the current log entry
+   * @param index index which is being updated
+   */
+  default void notifyIndexUpdate(long term, long index) {
+
+  }
+
+  /**
    * Apply a committed log entry to the state machine. This method can be called concurrently with
    * the other calls, and there is no guarantee that the calls will be ordered according to the
    * log commit order.
@@ -228,6 +240,18 @@ public interface StateMachine extends Closeable {
    * @return a future for the flush task, null otherwise
    */
   default CompletableFuture<Void> flushStateMachineData(long index) {
+    return CompletableFuture.completedFuture(null);
+  }
+
+  /**
+   * Truncates asynchronously the associated state machine data starting from the given log
+   * index from the state machine. It will be a no op if the corresponding log entry does not
+   * have associated stateMachineData.
+   * @param index log Index starting from which the stateMachineData will be truncated.
+   * @return a combined future for the remove task for all the log entries starting from
+   *         given logIndex, null otherwise
+   */
+  default CompletableFuture<Void> truncateStateMachineData(long index) {
     return CompletableFuture.completedFuture(null);
   }
 }

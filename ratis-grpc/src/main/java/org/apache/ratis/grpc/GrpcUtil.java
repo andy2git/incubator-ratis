@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -23,7 +23,11 @@ import org.apache.ratis.thirdparty.io.grpc.Metadata;
 import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
-import org.apache.ratis.util.*;
+import org.apache.ratis.util.IOUtils;
+import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.LogUtils;
+import org.apache.ratis.util.ReflectionUtils;
+import org.apache.ratis.util.function.CheckedSupplier;
 import org.slf4j.Logger;
 
 import java.io.IOException;
@@ -34,6 +38,8 @@ import java.util.function.Supplier;
 public interface GrpcUtil {
   Metadata.Key<String> EXCEPTION_TYPE_KEY =
       Metadata.Key.of("exception-type", Metadata.ASCII_STRING_MARSHALLER);
+  Metadata.Key<byte[]> EXCEPTION_OBJECT_KEY =
+      Metadata.Key.of("exception-object-bin", Metadata.BINARY_BYTE_MARSHALLER);
   Metadata.Key<String> CALL_ID =
       Metadata.Key.of("call-id", Metadata.ASCII_STRING_MARSHALLER);
 
@@ -46,6 +52,7 @@ public interface GrpcUtil {
 
     Metadata trailers = new Metadata();
     trailers.put(EXCEPTION_TYPE_KEY, t.getClass().getCanonicalName());
+    trailers.put(EXCEPTION_OBJECT_KEY, IOUtils.object2Bytes(t));
     if (callId > 0) {
       trailers.put(CALL_ID, String.valueOf(callId));
     }
@@ -70,8 +77,21 @@ public interface GrpcUtil {
 
   static IOException tryUnwrapException(StatusRuntimeException se) {
     final Metadata trailers = se.getTrailers();
+    if (trailers == null) {
+      return null;
+    }
+
+    final byte[] bytes = trailers.get(EXCEPTION_OBJECT_KEY);
+    if (bytes != null) {
+      try {
+        return IOUtils.bytes2Object(bytes, IOException.class);
+      } catch (Exception e) {
+        se.addSuppressed(e);
+      }
+    }
+
     final Status status = se.getStatus();
-    if (trailers != null && status != null) {
+    if (status != null) {
       final String className = trailers.get(EXCEPTION_TYPE_KEY);
       if (className != null) {
         try {

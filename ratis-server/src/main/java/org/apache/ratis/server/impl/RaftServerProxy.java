@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -20,19 +20,26 @@ package org.apache.ratis.server.impl;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto;
+import org.apache.ratis.proto.RaftProtos.AppendEntriesRequestProto;
+import org.apache.ratis.proto.RaftProtos.CommitInfoProto;
+import org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto;
+import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
+import org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto;
+import org.apache.ratis.proto.RaftProtos.RequestVoteReplyProto;
+import org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto;
 import org.apache.ratis.protocol.*;
 import org.apache.ratis.rpc.RpcType;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.RaftServerRpc;
-import org.apache.ratis.proto.RaftProtos.*;
 import org.apache.ratis.statemachine.StateMachine;
-import org.apache.ratis.util.CheckedFunction;
 import org.apache.ratis.util.IOUtils;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.Preconditions;
 import org.apache.ratis.util.ProtoUtils;
+import org.apache.ratis.util.function.CheckedFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,10 +55,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -61,7 +65,7 @@ public class RaftServerProxy implements RaftServer {
   /**
    * A map: {@link RaftGroupId} -> {@link RaftServerImpl} futures.
    *
-   * The map is synchronized for mutations and the bulk {@link #getAll()} method
+   * The map is synchronized for mutations and the bulk {@link #getGroupIds()}/{@link #getAll()} methods
    * but the (non-bulk) {@link #get(RaftGroupId)} and {@link #containsGroup(RaftGroupId)} methods are not.
    * The thread safety and atomicity guarantees for the non-bulk methods are provided by {@link ConcurrentMap}.
    */
@@ -101,6 +105,10 @@ public class RaftServerProxy implements RaftServer {
       isClosed = true;
       map.values().parallelStream().map(CompletableFuture::join)
           .forEach(impl -> impl.shutdown(false));
+    }
+
+    synchronized List<RaftGroupId> getGroupIds() {
+      return new ArrayList<>(map.keySet());
     }
 
     synchronized List<CompletableFuture<RaftServerImpl>> getAll() {
@@ -149,6 +157,8 @@ public class RaftServerProxy implements RaftServer {
   private final RaftServerRpc serverRpc;
   private final ServerFactory factory;
 
+  private ExecutorService implExecutor;
+
   private final ImplMap impls = new ImplMap();
 
   RaftServerProxy(RaftPeerId id, StateMachine.Registry stateMachineRegistry,
@@ -161,7 +171,9 @@ public class RaftServerProxy implements RaftServer {
 
     this.serverRpc = factory.newRaftServerRpc(this);
     this.id = id != null? id: RaftPeerId.valueOf(getIdStringFrom(serverRpc));
-    this.lifeCycle = new LifeCycle(this.id);
+    this.lifeCycle = new LifeCycle(this.id + "-" + getClass().getSimpleName());
+
+    this.implExecutor = Executors.newSingleThreadExecutor();
   }
 
   /** Check the storage dir and add groups*/
@@ -197,7 +209,7 @@ public class RaftServerProxy implements RaftServer {
       } catch(IOException e) {
         throw new CompletionException(getId() + ": Failed to initialize server for " + group, e);
       }
-    });
+    }, implExecutor);
   }
 
   private static String getIdStringFrom(RaftServerRpc rpc) {
@@ -217,8 +229,8 @@ public class RaftServerProxy implements RaftServer {
   }
 
   @Override
-  public Iterable<RaftGroupId> getGroupIds() throws IOException {
-    return getImpls().stream().map(RaftServerImpl::getGroupId).collect(Collectors.toList());
+  public List<RaftGroupId> getGroupIds() {
+    return impls.getGroupIds();
   }
 
   @Override
@@ -291,6 +303,13 @@ public class RaftServerProxy implements RaftServer {
 
   @Override
   public void close() {
+    try {
+      implExecutor.shutdown();
+      implExecutor.awaitTermination(1, TimeUnit.DAYS);
+    } catch (Exception e) {
+      LOG.warn(getId() + ": Failed to shutdown " + getRpcType() + " server");
+    }
+
     lifeCycle.checkStateAndClose(() -> {
       LOG.info("{}: close", getId());
       impls.close();
@@ -362,7 +381,7 @@ public class RaftServerProxy implements RaftServer {
           final boolean started = newImpl.start();
           Preconditions.assertTrue(started, () -> getId()+ ": failed to start a new impl: " + newImpl);
           return new RaftClientReply(request, newImpl.getCommitInfos());
-        })
+        }, implExecutor)
         .whenComplete((_1, throwable) -> {
           if (throwable != null) {
             impls.remove(newGroup.getGroupId());
@@ -390,17 +409,13 @@ public class RaftServerProxy implements RaftServer {
   }
 
   @Override
-  public GroupListReply getGroupList(GroupListRequest request)
-      throws IOException {
-    return RaftServerImpl.waitForReply(getId(), request, getGroupListAsync(request),
-        r -> null);
+  public GroupListReply getGroupList(GroupListRequest request) {
+    return new GroupListReply(request, getGroupIds());
   }
 
   @Override
-  public CompletableFuture<GroupListReply> getGroupListAsync(
-      GroupListRequest request) {
-    return getImplFuture(request.getRaftGroupId()).thenApplyAsync(
-        server -> server.getGroupList(request));
+  public CompletableFuture<GroupListReply> getGroupListAsync(GroupListRequest request) {
+    return CompletableFuture.completedFuture(getGroupList(request));
   }
 
   @Override
@@ -409,11 +424,10 @@ public class RaftServerProxy implements RaftServer {
   }
 
   @Override
-  public CompletableFuture<GroupInfoReply> getGroupInfoAsync(GroupInfoRequest request) throws IOException {
+  public CompletableFuture<GroupInfoReply> getGroupInfoAsync(GroupInfoRequest request) {
     return getImplFuture(request.getRaftGroupId()).thenApplyAsync(
         server -> server.getGroupInfo(request));
   }
-
 
   /**
    * Handle a raft configuration change request from client.

@@ -103,7 +103,7 @@ public class BaseStateMachine implements StateMachine {
     return lastAppliedTermIndex.get();
   }
 
-  protected void setLastAppliedTermIndex(TermIndex newTI) {
+  public void setLastAppliedTermIndex(TermIndex newTI) {
     lastAppliedTermIndex.set(newTI);
   }
 
@@ -170,9 +170,11 @@ public class BaseStateMachine implements StateMachine {
   }
 
   @Override
-  public TransactionContext startTransaction(RaftClientRequest request)
-      throws IOException {
-    return new TransactionContextImpl(this, request, null);
+  public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
+    return TransactionContext.newBuilder()
+        .setStateMachine(this)
+        .setClientRequest(request)
+        .build();
   }
 
   @Override

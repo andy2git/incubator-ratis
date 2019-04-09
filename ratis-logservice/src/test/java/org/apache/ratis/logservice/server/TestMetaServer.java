@@ -22,8 +22,8 @@ import org.apache.ratis.logservice.api.*;
 import org.apache.ratis.logservice.client.LogServiceClient;
 import org.apache.ratis.logservice.common.LogAlreadyExistException;
 import org.apache.ratis.logservice.common.LogNotFoundException;
+import org.apache.ratis.logservice.server.LogServer;
 import org.apache.ratis.logservice.util.LogServiceCluster;
-import org.apache.ratis.logservice.worker.LogServiceWorker;
 import org.apache.ratis.server.impl.RaftServerImpl;
 import org.apache.ratis.server.impl.RaftServerProxy;
 import org.junit.AfterClass;
@@ -36,7 +36,9 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.stream.IntStream;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 
 
@@ -48,13 +50,15 @@ public class TestMetaServer {
     public static void beforeClass() {
         cluster = new LogServiceCluster(3);
         cluster.createWorkers(3);
-        List<LogServiceWorker> workers = cluster.getWorkers();
+        List<LogServer> workers = cluster.getWorkers();
         assert(workers.size() == 3);
     }
 
     @AfterClass
     public static void afterClass() {
-        cluster.close();
+        if (cluster != null) {
+          cluster.close();
+        }
     }
 
     /**
@@ -80,21 +84,20 @@ public class TestMetaServer {
         ByteBuffer testMessage =  ByteBuffer.wrap("Hello world!".getBytes());
         List<LogInfo> listLogs = client.listLogs();
         assert(listLogs.stream().filter(log -> log.getLogName().getName().startsWith("testReadWrite")).count() == 1);
-        List<LogServiceWorker> workers = cluster.getWorkers();
-        for(LogServiceWorker worker : workers) {
+        List<LogServer> workers = cluster.getWorkers();
+        for(LogServer worker : workers) {
              RaftServerImpl server = ((RaftServerProxy)worker.getServer())
                      .getImpl(listLogs.get(0).getRaftGroup().getGroupId());
         // TODO: perform all additional checks on state machine level
         }
         writer.write(testMessage);
-        for(LogServiceWorker worker : workers) {
+        for(LogServer worker : workers) {
             RaftServerImpl server = ((RaftServerProxy)worker.getServer())
                     .getImpl(listLogs.get(0).getRaftGroup().getGroupId());
         }
 //        assert(stream.getSize() > 0); //TODO: Doesn't work
         LogReader reader = stream.createReader();
-        ByteBuffer res = reader.readNext(); //TODO: first is conf log entry
-        res = reader.readNext();
+        ByteBuffer res = reader.readNext();
         assert(res.array().length > 0);
     }
 

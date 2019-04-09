@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,8 +17,10 @@
  */
 package org.apache.ratis.util;
 
+import org.apache.ratis.protocol.AlreadyClosedException;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.util.function.CheckedFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,7 +55,7 @@ public class PeerProxyMap<PROXY extends Closeable> implements Closeable {
           if (proxy == null) {
             final LifeCycle.State current = lifeCycle.getCurrentState();
             if (current.isOneOf(LifeCycle.State.CLOSING, LifeCycle.State.CLOSED)) {
-              throw new IOException(name + " is already " + current);
+              throw new AlreadyClosedException(name + " is already " + current);
             }
             lifeCycle.startAndTransition(
                 () -> proxy = createProxy.apply(peer), IOException.class);
@@ -119,16 +121,21 @@ public class PeerProxyMap<PROXY extends Closeable> implements Closeable {
     LOG.debug("{}: reset proxy for {}", name, id );
     synchronized (resetLock) {
       final PeerAndProxy pp = peers.remove(id);
-      final RaftPeer peer = pp.getPeer();
-      pp.close();
-      computeIfAbsent(peer);
+      if (pp != null) {
+        final RaftPeer peer = pp.getPeer();
+        pp.close();
+        computeIfAbsent(peer);
+      }
     }
   }
 
-  public void handleException(RaftPeerId serverId, Exception e, boolean reconnect) {
+  /** @return true if the given throwable is handled; otherwise, the call is an no-op, return false. */
+  public boolean handleException(RaftPeerId serverId, Throwable e, boolean reconnect) {
     if (reconnect || IOUtils.shouldReconnect(e)) {
       resetProxy(serverId);
+      return true;
     }
+    return false;
   }
 
   public PROXY createProxyImpl(RaftPeer peer) throws IOException {

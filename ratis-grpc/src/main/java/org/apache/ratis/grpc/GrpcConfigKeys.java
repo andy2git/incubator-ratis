@@ -17,19 +17,69 @@
  */
 package org.apache.ratis.grpc;
 
-import org.apache.ratis.client.RaftClientConfigKeys;
+import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.util.SizeInBytes;
 import org.apache.ratis.util.TimeDuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static org.apache.ratis.conf.ConfUtils.*;
 
 public interface GrpcConfigKeys {
   String PREFIX = "raft.grpc";
+
+  interface TLS {
+    Logger LOG = LoggerFactory.getLogger(TLS.class);
+    static Consumer<String> getDefaultLog() {
+      return LOG::info;
+    }
+
+    String TLS_ROOT_PREFIX = GrpcConfigKeys.PREFIX + ".tls";
+
+    String TLS_ENABLED_KEY = TLS_ROOT_PREFIX + ".enabled";
+    boolean TLS_ENABLED_DEFAULT = false;
+    static boolean tlsEnabled(RaftProperties properties) {
+      return getBoolean(properties::getBoolean, TLS_ENABLED_KEY, TLS_ENABLED_DEFAULT, getDefaultLog());
+    }
+
+    String MUTUAL_AUTHN_ENABLED_KEY = TLS_ROOT_PREFIX + ".mutual_authn.enabled";
+    boolean MUTUAL_AUTHN_ENABLED_DEFAULT = false;
+    static boolean mutualAuthnEnabled(RaftProperties properties) {
+      return getBoolean(properties::getBoolean,
+          MUTUAL_AUTHN_ENABLED_KEY, MUTUAL_AUTHN_ENABLED_DEFAULT, getDefaultLog());
+    }
+
+    String PRIVATE_KEY_FILE_KEY = TLS_ROOT_PREFIX + ".private.key.file.name";
+    String PRIVATE_KEY_FILE_DEFAULT = "private.pem";
+    static String getPrivateKeyFile(RaftProperties properties) {
+      return get(properties::get, PRIVATE_KEY_FILE_KEY, PRIVATE_KEY_FILE_DEFAULT, getDefaultLog());
+    }
+
+    String CERT_CHAIN_FILE_KEY = TLS_ROOT_PREFIX + ".cert.chain.file.name";
+    String CERT_CHAIN_FILE_DEFAULT = "certificate.crt";
+    static String getCertChainFile(RaftProperties properties) {
+      return get(properties::get, CERT_CHAIN_FILE_KEY, CERT_CHAIN_FILE_DEFAULT, getDefaultLog());
+    }
+
+    String TRUST_STORE_KEY = TLS_ROOT_PREFIX + ".trust.store";
+    String TRUST_STORE_DEFAULT = "ca.crt";
+    static String getTrustStore(RaftProperties properties) {
+      return get(properties::get, TRUST_STORE_KEY, TRUST_STORE_DEFAULT, getDefaultLog());
+    }
+
+    String CONF_PARAMETER = TLS_ROOT_PREFIX + ".conf";
+    Class<GrpcTlsConfig> CONF_CLASS = GrpcTlsConfig.class;
+    static GrpcTlsConfig getConf(Parameters parameters) {
+      return parameters != null ? parameters.get(CONF_PARAMETER, CONF_CLASS): null;
+    }
+    static void setConf(Parameters parameters, GrpcTlsConfig conf) {
+      parameters.put(CONF_PARAMETER, conf, GrpcTlsConfig.class);
+    }
+  }
 
   interface Server {
     Logger LOG = LoggerFactory.getLogger(Server.class);
@@ -89,7 +139,7 @@ public interface GrpcConfigKeys {
     }
 
     String RETRY_INTERVAL_KEY = PREFIX + ".retry.interval";
-    TimeDuration RETRY_INTERVAL_DEFAULT = RaftClientConfigKeys.Rpc.RETRY_INTERVAL_DEFAULT;
+    TimeDuration RETRY_INTERVAL_DEFAULT = TimeDuration.valueOf(300, TimeUnit.MILLISECONDS);
     static TimeDuration retryInterval(RaftProperties properties) {
       return getTimeDuration(properties.getTimeDuration(RETRY_INTERVAL_DEFAULT.getUnit()),
           RETRY_INTERVAL_KEY, RETRY_INTERVAL_DEFAULT, getDefaultLog());
@@ -106,6 +156,25 @@ public interface GrpcConfigKeys {
     }
     static void setOutstandingAppendsMax(RaftProperties properties, int maxOutstandingAppends) {
       setInt(properties::setInt, OUTSTANDING_APPENDS_MAX_KEY, maxOutstandingAppends);
+    }
+  }
+
+  interface LogAppender {
+    Logger LOG = LoggerFactory.getLogger(Server.class);
+    static Consumer<String> getDefaultLog() {
+      return LOG::info;
+    }
+
+    String PREFIX = GrpcConfigKeys.PREFIX + ".log.appender";
+
+    String INSTALL_SNAPSHOT_ENABLED_KEY = PREFIX + ".install.snapshot.enabled";
+    boolean INSTALL_SNAPSHOT_ENABLED_DEFAULT = true;
+    static boolean installSnapshotEnabled(RaftProperties properties) {
+      return getBoolean(properties::getBoolean,
+          INSTALL_SNAPSHOT_ENABLED_KEY, INSTALL_SNAPSHOT_ENABLED_DEFAULT, getDefaultLog());
+    }
+    static void setInstallSnapshotEnabled(RaftProperties properties, boolean shouldInstallSnapshot) {
+      setBoolean(properties::setBoolean, INSTALL_SNAPSHOT_ENABLED_KEY, shouldInstallSnapshot);
     }
   }
 

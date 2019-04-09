@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,7 +17,6 @@
  */
 package org.apache.ratis.server;
 
-import org.apache.ratis.conf.ConfUtils;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.util.SizeInBytes;
 import org.apache.ratis.util.TimeDuration;
@@ -79,6 +78,29 @@ public interface RaftServerConfigKeys {
 
   }
 
+  String WATCH_TIMEOUT_DENOMINATION_KEY = PREFIX + ".watch.timeout.denomination";
+  TimeDuration WATCH_TIMEOUT_DENOMINATION_DEFAULT = TimeDuration.valueOf(1, TimeUnit.SECONDS);
+  static TimeDuration watchTimeoutDenomination(RaftProperties properties) {
+    return getTimeDuration(properties.getTimeDuration(WATCH_TIMEOUT_DENOMINATION_DEFAULT.getUnit()),
+        WATCH_TIMEOUT_DENOMINATION_KEY, WATCH_TIMEOUT_DENOMINATION_DEFAULT, getDefaultLog(), requirePositive());
+  }
+  static void setWatchTimeoutDenomination(RaftProperties properties, TimeDuration watchTimeout) {
+    setTimeDuration(properties::setTimeDuration, WATCH_TIMEOUT_DENOMINATION_KEY, watchTimeout);
+  }
+
+  /**
+   * Timeout for watch requests.
+   */
+  String WATCH_TIMEOUT_KEY = PREFIX + ".watch.timeout";
+  TimeDuration WATCH_TIMEOUT_DEFAULT = TimeDuration.valueOf(10, TimeUnit.SECONDS);
+  static TimeDuration watchTimeout(RaftProperties properties) {
+    return getTimeDuration(properties.getTimeDuration(WATCH_TIMEOUT_DEFAULT.getUnit()),
+        WATCH_TIMEOUT_KEY, WATCH_TIMEOUT_DEFAULT, getDefaultLog(), requirePositive());
+  }
+  static void setWatchTimeout(RaftProperties properties, TimeDuration watchTimeout) {
+    setTimeDuration(properties::setTimeDuration, WATCH_TIMEOUT_KEY, watchTimeout);
+  }
+
   interface Log {
     String PREFIX = RaftServerConfigKeys.PREFIX + ".log";
 
@@ -89,6 +111,26 @@ public interface RaftServerConfigKeys {
     }
     static void setUseMemory(RaftProperties properties, boolean useMemory) {
       setBoolean(properties::setBoolean, USE_MEMORY_KEY, useMemory);
+    }
+
+    String QUEUE_ELEMENT_LIMIT_KEY = PREFIX + ".queue.element-limit";
+    int QUEUE_ELEMENT_LIMIT_DEFAULT = 4096;
+    static int queueElementLimit(RaftProperties properties) {
+      return getInt(properties::getInt, QUEUE_ELEMENT_LIMIT_KEY, QUEUE_ELEMENT_LIMIT_DEFAULT, getDefaultLog(),
+          requireMin(1));
+    }
+    static void setElementLimit(RaftProperties properties, int queueSize) {
+      setInt(properties::setInt, QUEUE_ELEMENT_LIMIT_KEY, queueSize, requireMin(1));
+    }
+
+    String QUEUE_BYTE_LIMIT_KEY = PREFIX + ".queue.byte-limit";
+    SizeInBytes QUEUE_BYTE_LIMIT_DEFAULT = SizeInBytes.valueOf("64MB");
+    static SizeInBytes queueByteLimit(RaftProperties properties) {
+      return getSizeInBytes(properties::getSizeInBytes,
+          QUEUE_BYTE_LIMIT_KEY, QUEUE_BYTE_LIMIT_DEFAULT, getDefaultLog());
+    }
+    static void setByteLimit(RaftProperties properties, int queueSize) {
+      setInt(properties::setInt, QUEUE_BYTE_LIMIT_KEY, queueSize, requireMin(1));
     }
 
     String SEGMENT_SIZE_MAX_KEY = PREFIX + ".segment.size.max";
@@ -156,6 +198,15 @@ public interface RaftServerConfigKeys {
       static void setSync(RaftProperties properties, boolean sync) {
         setBoolean(properties::setBoolean, SYNC_KEY, sync);
       }
+      String CACHING_ENABLED_KEY = PREFIX + ".caching.enabled";
+      boolean CACHING_ENABLED_DEFAULT = false;
+      static boolean cachingEnabled(RaftProperties properties) {
+        return getBoolean(properties::getBoolean,
+            CACHING_ENABLED_KEY, CACHING_ENABLED_DEFAULT, getDefaultLog());
+      }
+      static void setCachingEnabled(RaftProperties properties, boolean enable) {
+        setBoolean(properties::setBoolean, CACHING_ENABLED_KEY, enable);
+      }
 
       String SYNC_TIMEOUT_KEY = PREFIX + ".sync.timeout";
       TimeDuration SYNC_TIMEOUT_DEFAULT = TimeDuration.valueOf(10, TimeUnit.SECONDS);
@@ -166,28 +217,45 @@ public interface RaftServerConfigKeys {
       static void setSyncTimeout(RaftProperties properties, TimeDuration syncTimeout) {
         setTimeDuration(properties::setTimeDuration, SYNC_TIMEOUT_KEY, syncTimeout);
       }
+
+      /**
+       * -1: retry indefinitely
+       *  0: no retry
+       * >0: the number of retries
+       */
+      String SYNC_TIMEOUT_RETRY_KEY = PREFIX + ".sync.timeout.retry";
+      int SYNC_TIMEOUT_RETRY_DEFAULT = -1;
+      static int syncTimeoutRetry(RaftProperties properties) {
+        return getInt(properties::getInt, SYNC_TIMEOUT_RETRY_KEY, SYNC_TIMEOUT_RETRY_DEFAULT, getDefaultLog(),
+            requireMin(-1));
+      }
+      static void setSyncTimeoutRetry(RaftProperties properties, int syncTimeoutRetry) {
+        setInt(properties::setInt, SYNC_TIMEOUT_RETRY_KEY, syncTimeoutRetry, requireMin(-1));
+      }
     }
 
     interface Appender {
       String PREFIX = Log.PREFIX + ".appender";
 
-      String BUFFER_CAPACITY_KEY = PREFIX + ".buffer.capacity";
-      SizeInBytes BUFFER_CAPACITY_DEFAULT =SizeInBytes.valueOf("4MB");
-      static SizeInBytes bufferCapacity(RaftProperties properties) {
-        return getSizeInBytes(properties::getSizeInBytes,
-            BUFFER_CAPACITY_KEY, BUFFER_CAPACITY_DEFAULT, getDefaultLog());
+      String BUFFER_ELEMENT_LIMIT_KEY = PREFIX + ".buffer.element-limit";
+      /** 0 means no limit. */
+      int BUFFER_ELEMENT_LIMIT_DEFAULT = 0;
+      static int bufferElementLimit(RaftProperties properties) {
+        return getInt(properties::getInt,
+            BUFFER_ELEMENT_LIMIT_KEY, BUFFER_ELEMENT_LIMIT_DEFAULT, getDefaultLog(), requireMin(0));
       }
-      static void setBufferCapacity(RaftProperties properties, SizeInBytes bufferCapacity) {
-        setSizeInBytes(properties::set, BUFFER_CAPACITY_KEY, bufferCapacity);
+      static void setBufferElementLimit(RaftProperties properties, int bufferElementLimit) {
+        setInt(properties::setInt, BUFFER_ELEMENT_LIMIT_KEY, bufferElementLimit);
       }
 
-      String BATCH_ENABLED_KEY = PREFIX + ".batch.enabled";
-      boolean BATCH_ENABLED_DEFAULT = false;
-      static boolean batchEnabled(RaftProperties properties) {
-        return getBoolean(properties::getBoolean, BATCH_ENABLED_KEY, BATCH_ENABLED_DEFAULT, getDefaultLog());
+      String BUFFER_BYTE_LIMIT_KEY = PREFIX + ".buffer.byte-limit";
+      SizeInBytes BUFFER_BYTE_LIMIT_DEFAULT = SizeInBytes.valueOf("4MB");
+      static SizeInBytes bufferByteLimit(RaftProperties properties) {
+        return getSizeInBytes(properties::getSizeInBytes,
+            BUFFER_BYTE_LIMIT_KEY, BUFFER_BYTE_LIMIT_DEFAULT, getDefaultLog());
       }
-      static void setBatchEnabled(RaftProperties properties, boolean batchEnabled) {
-        setBoolean(properties::setBoolean, BATCH_ENABLED_KEY, batchEnabled);
+      static void setBufferByteLimit(RaftProperties properties, SizeInBytes bufferByteLimit) {
+        setSizeInBytes(properties::set, BUFFER_BYTE_LIMIT_KEY, bufferByteLimit);
       }
 
       String SNAPSHOT_CHUNK_SIZE_MAX_KEY = PREFIX + ".snapshot.chunk.size.max";
@@ -287,17 +355,6 @@ public interface RaftServerConfigKeys {
   /** server retry cache related */
   interface RetryCache {
     String PREFIX = RaftServerConfigKeys.PREFIX + ".retrycache";
-
-    String CAPACITY_KEY = PREFIX + ".capacity";
-    int CAPACITY_DEFAULT = 4096;
-    static int capacity(RaftProperties properties) {
-      return ConfUtils.getInt(properties::getInt, CAPACITY_KEY, CAPACITY_DEFAULT, getDefaultLog(),
-          ConfUtils.requireMin(0));
-    }
-
-    static void setCapacity(RaftProperties properties, int capacity) {
-      setInt(properties::setInt, CAPACITY_KEY, capacity);
-    }
 
     String EXPIRY_TIME_KEY = PREFIX + ".expirytime";
     TimeDuration EXPIRY_TIME_DEFAULT = TimeDuration.valueOf(60, TimeUnit.SECONDS);

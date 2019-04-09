@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,7 +19,13 @@ package org.apache.ratis;
 
 import org.apache.log4j.Level;
 import org.apache.ratis.conf.ConfUtils;
-import org.apache.ratis.util.*;
+import org.apache.ratis.util.ExitUtils;
+import org.apache.ratis.util.FileUtils;
+import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.LogUtils;
+import org.apache.ratis.util.TimeDuration;
+import org.apache.ratis.util.function.CheckedRunnable;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.rules.TestName;
@@ -32,18 +38,29 @@ import java.io.IOException;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 public abstract class BaseTest {
   public final Logger LOG = LoggerFactory.getLogger(getClass());
 
+  public static final TimeDuration HUNDRED_MILLIS = TimeDuration.valueOf(100, TimeUnit.MILLISECONDS);
+  public static final TimeDuration ONE_SECOND = TimeDuration.valueOf(1, TimeUnit.SECONDS);
+
   {
     LogUtils.setLogLevel(ConfUtils.LOG, Level.WARN);
     LogUtils.setLogLevel(FileUtils.LOG, Level.TRACE);
+
+    ExitUtils.disableSystemExit();
+  }
+
+  @After
+  public void assertNotTerminated() {
+    ExitUtils.assertNotTerminated();
   }
 
   @Rule
-  public final Timeout globalTimeout = new Timeout(getGlobalTimeoutSeconds() * 1000);
+  public final Timeout globalTimeout = new Timeout(getGlobalTimeoutSeconds(), TimeUnit.SECONDS );
 
   @Rule
   public final TestName testName = new TestName();
@@ -77,16 +94,17 @@ public abstract class BaseTest {
     return new File(getClassTestDir(), testName.getMethodName());
   }
 
+  @SafeVarargs
   public static void assertThrowable(
       String description, Throwable t,
-      Class<? extends Throwable> exceptedThrowableClass, Logger log,
-      Class<? extends Throwable>... exceptedCauseClasses) {
+      Class<? extends Throwable> expectedThrowableClass, Logger log,
+      Class<? extends Throwable>... expectedCauseClasses) {
     if (log != null) {
       log.info("The test \"" + description + "\" throws " + t.getClass().getSimpleName(), t);
     }
-    Assert.assertEquals(exceptedThrowableClass, t.getClass());
+    Assert.assertEquals(expectedThrowableClass, t.getClass());
 
-    for (Class<? extends Throwable> expectedCause : exceptedCauseClasses) {
+    for (Class<? extends Throwable> expectedCause : expectedCauseClasses) {
       final Throwable previous = t;
       t = Objects.requireNonNull(previous.getCause(),
           () -> "previous.getCause() == null for previous=" + previous);
@@ -94,45 +112,47 @@ public abstract class BaseTest {
     }
   }
 
-  public static void testFailureCase(
+  @SafeVarargs
+  public static Throwable testFailureCase(
       String description, CheckedRunnable<?> testCode,
-      Class<? extends Throwable> exceptedThrowableClass, Logger log,
-      Class<? extends Throwable>... exceptedCauseClasses) {
-    boolean caught = false;
+      Class<? extends Throwable> expectedThrowableClass, Logger log,
+      Class<? extends Throwable>... expectedCauseClasses) {
     try {
       testCode.run();
     } catch (Throwable t) {
-      caught = true;
-      assertThrowable(description, t, exceptedThrowableClass, log, exceptedCauseClasses);
+      assertThrowable(description, t, expectedThrowableClass, log, expectedCauseClasses);
+      return t;
     }
-    if (!caught) {
-      Assert.fail("The test \"" + description + "\" does not throw anything.");
-    }
+    throw new AssertionError("The test \"" + description + "\" does not throw anything.");
   }
 
-  public void testFailureCase(
+  @SafeVarargs
+  public final Throwable testFailureCase(
       String description, CheckedRunnable<?> testCode,
-      Class<? extends Throwable> exceptedThrowableClass,
-      Class<? extends Throwable>... exceptedCauseClasses) {
-    testFailureCase(description, testCode, exceptedThrowableClass, LOG, exceptedCauseClasses);
+      Class<? extends Throwable> expectedThrowableClass,
+      Class<? extends Throwable>... expectedCauseClasses) {
+    return testFailureCase(description, testCode, expectedThrowableClass, LOG, expectedCauseClasses);
   }
 
-  public static void testFailureCaseAsync(
+  @SafeVarargs
+  public static Throwable testFailureCaseAsync(
       String description, Supplier<CompletableFuture<?>> testCode,
-      Class<? extends Throwable> exceptedThrowableClass, Logger log,
-      Class<? extends Throwable>... exceptedCauseClasses) {
+      Class<? extends Throwable> expectedThrowableClass, Logger log,
+      Class<? extends Throwable>... expectedCauseClasses) {
     try {
       testCode.get().join();
-      Assert.fail("The test \"" + description + "\" does not throw anything.");
     } catch (Throwable t) {
       t = JavaUtils.unwrapCompletionException(t);
-      assertThrowable(description, t, exceptedThrowableClass, log, exceptedCauseClasses);
+      assertThrowable(description, t, expectedThrowableClass, log, expectedCauseClasses);
+      return t;
     }
+    throw new AssertionError("The test \"" + description + "\" does not throw anything.");
   }
 
-  public void testFailureCaseAsync(
-      String description, Supplier<CompletableFuture<?>> testCode, Class<? extends Throwable> exceptedThrowableClass,
-      Class<? extends Throwable>... exceptedCauseClasses) {
-    testFailureCaseAsync(description, testCode, exceptedThrowableClass, LOG, exceptedCauseClasses);
+  @SafeVarargs
+  public final Throwable testFailureCaseAsync(
+      String description, Supplier<CompletableFuture<?>> testCode, Class<? extends Throwable> expectedThrowableClass,
+      Class<? extends Throwable>... expectedCauseClasses) {
+    return testFailureCaseAsync(description, testCode, expectedThrowableClass, LOG, expectedCauseClasses);
   }
 }

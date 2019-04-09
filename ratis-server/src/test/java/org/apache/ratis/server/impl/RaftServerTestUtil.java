@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,15 +17,21 @@
  */
 package org.apache.ratis.server.impl;
 
+import org.apache.log4j.Level;
 import org.apache.ratis.MiniRaftCluster;
+import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.LogUtils;
+import org.apache.ratis.util.TimeDuration;
 import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.stream.Stream;
@@ -33,16 +39,20 @@ import java.util.stream.Stream;
 public class RaftServerTestUtil {
   static final Logger LOG = LoggerFactory.getLogger(RaftServerTestUtil.class);
 
+  public static void setWatchRequestsLogLevel(Level level) {
+    LogUtils.setLogLevel(WatchRequests.LOG, level);
+  }
+
   public static void waitAndCheckNewConf(MiniRaftCluster cluster,
-      RaftPeer[] peers, int numOfRemovedPeers, Collection<String> deadPeers)
+      RaftPeer[] peers, int numOfRemovedPeers, Collection<RaftPeerId> deadPeers)
       throws Exception {
-    final long sleepMs = cluster.getMaxTimeout() * (numOfRemovedPeers + 2);
+    final TimeDuration sleepTime = cluster.getTimeoutMax().apply(n -> n * (numOfRemovedPeers + 2));
     JavaUtils.attempt(() -> waitAndCheckNewConf(cluster, peers, deadPeers),
-        3, sleepMs, "waitAndCheckNewConf", LOG);
+        10, sleepTime, "waitAndCheckNewConf", LOG);
   }
   private static void waitAndCheckNewConf(MiniRaftCluster cluster,
-      RaftPeer[] peers, Collection<String> deadPeers) {
-    LOG.info(cluster.printServers());
+      RaftPeer[] peers, Collection<RaftPeerId> deadPeers) {
+    LOG.info("waitAndCheckNewConf: peers={}, deadPeers={}, {}", Arrays.asList(peers), deadPeers, cluster.printServers());
     Assert.assertNotNull(cluster.getLeader());
 
     int numIncluded = 0;
@@ -50,7 +60,8 @@ public class RaftServerTestUtil {
     final RaftConfiguration current = RaftConfiguration.newBuilder()
         .setConf(peers).setLogEntryIndex(0).build();
     for (RaftServerImpl server : cluster.iterateServerImpls()) {
-      if (deadPeers != null && deadPeers.contains(server.getId().toString())) {
+      LOG.info("checking {}", server);
+      if (deadPeers != null && deadPeers.contains(server.getId())) {
         if (current.containsInConf(server.getId())) {
           deadIncluded++;
         }
@@ -81,6 +92,10 @@ public class RaftServerTestUtil {
 
   public static boolean isRetryCacheEntryFailed(RetryCache.CacheEntry entry) {
     return entry.isFailed();
+  }
+
+  public static RaftPeerRole getRole(RaftServerImpl server) {
+    return server.getRole().getRaftPeerRole();
   }
 
   public static Stream<LogAppender> getLogAppenders(RaftServerImpl server) {

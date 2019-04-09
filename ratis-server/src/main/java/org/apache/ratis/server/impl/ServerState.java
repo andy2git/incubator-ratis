@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -105,9 +105,9 @@ public class ServerState implements Closeable {
 
     // On start the leader is null, start the clock now
     leaderId = null;
-    this.lastNoLeaderTime = new Timestamp();
+    this.lastNoLeaderTime = Timestamp.currentTime();
     this.leaderElectionTimeoutMs =
-        RaftServerConfigKeys.leaderElectionTimeout(prop).toInt(TimeUnit.MILLISECONDS);
+        RaftServerConfigKeys.leaderElectionTimeout(prop).toIntExact(TimeUnit.MILLISECONDS);
 
     // we cannot apply log entries to the state machine in this step, since we
     // do not know whether the local log entries have been committed.
@@ -182,8 +182,8 @@ public class ServerState implements Closeable {
     final RaftLog log;
     if (RaftServerConfigKeys.Log.useMemory(prop)) {
       final int maxBufferSize =
-          RaftServerConfigKeys.Log.Appender.bufferCapacity(prop).getSizeInt();
-      log = new MemoryRaftLog(id, maxBufferSize);
+          RaftServerConfigKeys.Log.Appender.bufferByteLimit(prop).getSizeInt();
+      log = new MemoryRaftLog(id, lastIndexInSnapshot, maxBufferSize);
     } else {
       log = new SegmentedRaftLog(id, server, this.storage,
           lastIndexInSnapshot, prop);
@@ -248,7 +248,7 @@ public class ServerState implements Closeable {
       String suffix;
       if (newLeaderId == null) {
         // reset the time stamp when a null leader is assigned
-        lastNoLeaderTime = new Timestamp();
+        lastNoLeaderTime = Timestamp.currentTime();
         suffix = "";
       } else {
         Timestamp previous = lastNoLeaderTime;
@@ -278,8 +278,9 @@ public class ServerState implements Closeable {
     return log;
   }
 
-  long applyLog(TransactionContext operation) throws StateMachineException {
-    return log.append(currentTerm, operation);
+  void appendLog(TransactionContext operation) throws StateMachineException {
+    log.append(currentTerm, operation);
+    Objects.requireNonNull(operation.getLogEntry());
   }
 
   /**

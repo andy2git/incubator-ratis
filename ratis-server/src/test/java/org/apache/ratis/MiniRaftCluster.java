@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -20,7 +20,17 @@ package org.apache.ratis;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
-import org.apache.ratis.protocol.*;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientReply;
+import org.apache.ratis.protocol.RaftClientRequest;
+import org.apache.ratis.protocol.RaftGroup;
+import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.retry.RetryPolicies;
+import org.apache.ratis.retry.RetryPolicy;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.impl.BlockRequestHandlingInjection;
@@ -29,10 +39,18 @@ import org.apache.ratis.server.impl.RaftServerProxy;
 import org.apache.ratis.server.impl.RaftServerTestUtil;
 import org.apache.ratis.server.storage.MemoryRaftLog;
 import org.apache.ratis.server.storage.RaftLog;
-import org.apache.ratis.proto.RaftProtos.ReplicationLevel;
-import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.statemachine.StateMachine;
-import org.apache.ratis.util.*;
+import org.apache.ratis.statemachine.impl.BaseStateMachine;
+import org.apache.ratis.util.CollectionUtils;
+import org.apache.ratis.util.Daemon;
+import org.apache.ratis.util.ExitUtils;
+import org.apache.ratis.util.FileUtils;
+import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.NetUtils;
+import org.apache.ratis.util.Preconditions;
+import org.apache.ratis.util.ReflectionUtils;
+import org.apache.ratis.util.TimeDuration;
+import org.apache.ratis.util.function.CheckedConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,19 +58,27 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Timer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 import static org.apache.ratis.server.impl.RaftServerConstants.DEFAULT_CALLID;
-import static org.apache.ratis.server.impl.RaftServerConstants.DEFAULT_SEQNUM;
 
 public abstract class MiniRaftCluster implements Closeable {
   public static final Logger LOG = LoggerFactory.getLogger(MiniRaftCluster.class);
@@ -60,10 +86,12 @@ public abstract class MiniRaftCluster implements Closeable {
   public static final String CLASS_NAME = MiniRaftCluster.class.getSimpleName();
   public static final String STATEMACHINE_CLASS_KEY = CLASS_NAME + ".statemachine.class";
   private static final StateMachine.Registry STATEMACHINE_REGISTRY_DEFAULT = gid -> new BaseStateMachine();
+  private static final TimeDuration RETRY_INTERVAL_DEFAULT =
+      TimeDuration.valueOf(100, TimeUnit.MILLISECONDS);
 
   public static abstract class Factory<CLUSTER extends MiniRaftCluster> {
     public interface Get<CLUSTER extends MiniRaftCluster> {
-      Supplier<RaftProperties> properties = JavaUtils.memoize(() -> new RaftProperties());
+      Supplier<RaftProperties> properties = JavaUtils.memoize(RaftProperties::new);
 
       Factory<CLUSTER> getFactory();
 
@@ -71,8 +99,65 @@ public abstract class MiniRaftCluster implements Closeable {
         return properties.get();
       }
 
-      default CLUSTER newCluster(int numPeers) throws IOException {
+      default CLUSTER newCluster(int numPeers) {
         return getFactory().newCluster(numPeers, getProperties());
+      }
+
+      default void runWithNewCluster(int numServers, CheckedConsumer<CLUSTER, Exception> testCase) throws Exception {
+        runWithNewCluster(numServers, true, testCase);
+      }
+
+      default void runWithNewCluster(int numServers, boolean startCluster, CheckedConsumer<CLUSTER, Exception> testCase)
+          throws Exception {
+        final StackTraceElement caller = JavaUtils.getCallerStackTraceElement();
+        LOG.info("Running " + caller.getMethodName());
+        final CLUSTER cluster = newCluster(numServers);
+        try {
+          if (startCluster) {
+            cluster.start();
+          }
+          testCase.accept(cluster);
+        } catch(Throwable t) {
+          LOG.info(cluster.printServers());
+          LOG.error("Failed " + caller, t);
+          throw t;
+        } finally {
+          cluster.shutdown();
+        }
+      }
+
+      default void runWithSameCluster(int numServers, CheckedConsumer<CLUSTER, Exception> testCase) throws Exception {
+        final StackTraceElement caller = JavaUtils.getCallerStackTraceElement();
+        LOG.info("Running " + caller.getMethodName());
+        CLUSTER cluster = null;
+        try {
+          cluster = getFactory().reuseCluster(numServers, getProperties());
+          testCase.accept(cluster);
+        } catch(Throwable t) {
+          if (cluster != null) {
+            LOG.info(cluster.printServers());
+          }
+          LOG.error("Failed " + caller, t);
+          throw t;
+        }
+      }
+    }
+
+    private final AtomicReference<CLUSTER> reusableCluster = new AtomicReference<>();
+
+    private CLUSTER reuseCluster(int numServers, RaftProperties prop) throws IOException {
+      for(;;) {
+        final CLUSTER cluster = reusableCluster.get();
+        if (cluster != null) {
+          return cluster;
+        }
+
+        final CLUSTER newCluster = newCluster(numServers, prop);
+        if (reusableCluster.compareAndSet(null, newCluster)) {
+          newCluster.start();
+          Runtime.getRuntime().addShutdownHook(new Thread(newCluster::shutdown));
+          return newCluster;
+        }
       }
     }
 
@@ -143,6 +228,10 @@ public abstract class MiniRaftCluster implements Closeable {
     return ids;
   }
 
+  public static int getIdIndex(String id) {
+    return Integer.parseInt(id.substring(1));
+  }
+
   protected RaftGroup group;
   protected final RaftProperties properties;
   protected final Parameters parameters;
@@ -151,7 +240,7 @@ public abstract class MiniRaftCluster implements Closeable {
 
   private volatile StateMachine.Registry stateMachineRegistry = null;
 
-  private final Timer timer;
+  private final AtomicReference<Timer> timer = new AtomicReference<>();
 
   protected MiniRaftCluster(String[] ids, RaftProperties properties, Parameters parameters) {
     this.group = initRaftGroup(Arrays.asList(ids));
@@ -159,8 +248,6 @@ public abstract class MiniRaftCluster implements Closeable {
     this.properties = new RaftProperties(properties);
     this.parameters = parameters;
 
-    this.timer = JavaUtils.runRepeatedly(() -> LOG.info("TIMED-PRINT: " + printServers()),
-        10, 10, TimeUnit.SECONDS);
     ExitUtils.disableSystemExit();
   }
 
@@ -199,6 +286,9 @@ public abstract class MiniRaftCluster implements Closeable {
 
     initServers();
     startServers(servers.values());
+
+    this.timer.updateAndGet(t -> t != null? t
+        : JavaUtils.runRepeatedly(() -> LOG.info("TIMED-PRINT: " + printServers()), 10, 10, TimeUnit.SECONDS));
   }
 
   /**
@@ -226,8 +316,8 @@ public abstract class MiniRaftCluster implements Closeable {
     start();
   }
 
-  public int getMaxTimeout() {
-    return RaftServerConfigKeys.Rpc.timeoutMax(properties).toInt(TimeUnit.MILLISECONDS);
+  public TimeDuration getTimeoutMax() {
+    return RaftServerConfigKeys.Rpc.timeoutMax(properties);
   }
 
   private RaftServerProxy newRaftServer(RaftPeerId id, RaftGroup group, boolean format) {
@@ -394,10 +484,6 @@ public abstract class MiniRaftCluster implements Closeable {
     return b.toString();
   }
 
-  public RaftServerImpl getLeaderAndSendFirstMessage() throws IOException {
-    return getLeaderAndSendFirstMessage(false);
-  }
-
   public RaftServerImpl getLeaderAndSendFirstMessage(boolean ignoreException) throws IOException {
     final RaftServerImpl leader = getLeader();
     try(RaftClient client = createClient(leader.getId())) {
@@ -410,15 +496,60 @@ public abstract class MiniRaftCluster implements Closeable {
     return leader;
   }
 
+  IllegalStateException newIllegalStateExceptionForNoLeaders(RaftGroupId groupId) {
+    final String g = groupId == null? "": " for " + groupId;
+    return new IllegalStateException("No leader yet " + g + ": " + printServers(groupId));
+  }
+
+  IllegalStateException newIllegalStateExceptionForMultipleLeaders(RaftGroupId groupId, List<RaftServerImpl> leaders) {
+    final String g = groupId == null? "": " for " + groupId;
+    return new IllegalStateException("Found multiple leaders" + g
+        + " at the same term (=" + leaders.get(0).getState().getCurrentTerm()
+        + "), leaders.size() = " + leaders.size() + " > 1, leaders = " + leaders
+        + ": " + printServers(groupId));
+  }
+
+  /**
+   * Get leader for the single group case.
+   * Do not use this method if this cluster has multiple groups.
+   *
+   * @return the unique leader with the highest term. Or, return null if there is no leader.
+   * @throws IllegalStateException if there are multiple leaders with the same highest term.
+   */
   public RaftServerImpl getLeader() {
-    return getLeader((RaftGroupId)null);
+    return getLeader(getLeaders(null), null, leaders -> {
+      throw newIllegalStateExceptionForMultipleLeaders(null, leaders);
+    });
   }
 
-  public RaftServerImpl getLeader(RaftGroupId groupId) {
-    return getLeader(getServerAliveStream(groupId));
+  RaftServerImpl getLeader(RaftGroupId groupId, Runnable handleNoLeaders,
+      Consumer<List<RaftServerImpl>> handleMultipleLeaders) {
+    return getLeader(getLeaders(groupId), handleNoLeaders, handleMultipleLeaders);
   }
 
-  static RaftServerImpl getLeader(Stream<RaftServerImpl> serverAliveStream) {
+  static RaftServerImpl getLeader(List<RaftServerImpl> leaders, Runnable handleNoLeaders,
+      Consumer<List<RaftServerImpl>> handleMultipleLeaders) {
+    if (leaders.isEmpty()) {
+      if (handleNoLeaders != null) {
+        handleNoLeaders.run();
+      }
+      return null;
+    } else if (leaders.size() > 1) {
+      if (handleMultipleLeaders != null) {
+        handleMultipleLeaders.accept(leaders);
+      }
+      return null;
+    } else {
+      return leaders.get(0);
+    }
+  }
+
+  /**
+   * @return the list of leaders with the highest term (i.e. leaders with a lower term are not included).
+   *         from the given group.
+   */
+  private List<RaftServerImpl> getLeaders(RaftGroupId groupId) {
+    final Stream<RaftServerImpl> serverAliveStream = getServerAliveStream(groupId);
     final List<RaftServerImpl> leaders = new ArrayList<>();
     serverAliveStream.filter(RaftServerImpl::isLeader).forEach(s -> {
       if (leaders.isEmpty()) {
@@ -434,13 +565,7 @@ public abstract class MiniRaftCluster implements Closeable {
         }
       }
     });
-    if (leaders.isEmpty()) {
-      return null;
-    } else if (leaders.size() > 1) {
-      throw new IllegalStateException(leaders
-          + ", leaders.size() = " + leaders.size() + " > 1");
-    }
-    return leaders.get(0);
+    return leaders;
   }
 
   boolean isLeader(String leaderId) {
@@ -469,7 +594,8 @@ public abstract class MiniRaftCluster implements Closeable {
 
   private Stream<RaftServerImpl> getServerStream(RaftGroupId groupId) {
     final Stream<RaftServerProxy> stream = getRaftServerProxyStream(groupId);
-    return groupId != null? stream.map(s -> RaftServerTestUtil.getRaftServerImpl(s, groupId))
+    return groupId != null?
+        stream.filter(s -> s.containsGroup(groupId)).map(s -> RaftServerTestUtil.getRaftServerImpl(s, groupId))
         : stream.flatMap(s -> RaftServerTestUtil.getRaftServerImpls(s).stream());
   }
 
@@ -479,6 +605,10 @@ public abstract class MiniRaftCluster implements Closeable {
 
   private Stream<RaftServerImpl> getServerAliveStream(RaftGroupId groupId) {
     return getServerStream(groupId).filter(RaftServerImpl::isAlive);
+  }
+
+  private RetryPolicy getDefaultRetryPolicy() {
+    return RetryPolicies.retryForeverWithSleep(RETRY_INTERVAL_DEFAULT);
   }
 
   public RaftServerProxy getServer(RaftPeerId id) {
@@ -521,35 +651,40 @@ public abstract class MiniRaftCluster implements Closeable {
     return createClient(leaderId, group);
   }
 
-  public RaftClient createClient(RaftPeerId leaderId, RaftGroup group) {
-    return createClient(leaderId, group, null);
+  public RaftClient createClient(RaftPeerId leaderId, RetryPolicy retryPolicy) {
+    return createClient(leaderId, group, null, retryPolicy);
   }
 
-  public RaftClient createClient(RaftPeerId leaderId, RaftGroup group, ClientId clientId) {
-    return RaftClient.newBuilder()
+  public RaftClient createClient(RaftPeerId leaderId, RaftGroup group) {
+    return createClient(leaderId, group, null, getDefaultRetryPolicy());
+  }
+
+  public RaftClient createClient(RaftPeerId leaderId, RaftGroup group,
+      ClientId clientId) {
+    return createClient(leaderId, group, clientId, getDefaultRetryPolicy());
+  }
+
+  public RaftClient createClient(RaftPeerId leaderId, RaftGroup group,
+      ClientId clientId, RetryPolicy retryPolicy) {
+    RaftClient.Builder builder = RaftClient.newBuilder()
         .setClientId(clientId)
         .setRaftGroup(group)
         .setLeaderId(leaderId)
         .setProperties(properties)
         .setParameters(parameters)
-        .build();
+        .setRetryPolicy(retryPolicy);
+    return builder.build();
   }
 
   public RaftClientRequest newRaftClientRequest(
       ClientId clientId, RaftPeerId leaderId, Message message) {
-    return newRaftClientRequest(clientId, leaderId,
-        DEFAULT_CALLID, DEFAULT_SEQNUM, message);
+    return newRaftClientRequest(clientId, leaderId, DEFAULT_CALLID, message);
   }
 
   public RaftClientRequest newRaftClientRequest(
-      ClientId clientId, RaftPeerId leaderId, long callId, long seqNum, Message message) {
-    return newRaftClientRequest(clientId, leaderId, callId, seqNum, message, ReplicationLevel.MAJORITY);
-  }
-
-  public RaftClientRequest newRaftClientRequest(
-      ClientId clientId, RaftPeerId leaderId, long callId, long seqNum, Message message, ReplicationLevel replication) {
+      ClientId clientId, RaftPeerId leaderId, long callId, Message message) {
     return new RaftClientRequest(clientId, leaderId, getGroupId(),
-        callId, seqNum, message, RaftClientRequest.writeRequestType(replication));
+        callId, message, RaftClientRequest.writeRequestType(), null);
   }
 
   public SetConfigurationRequest newSetConfigurationRequest(
@@ -580,6 +715,9 @@ public abstract class MiniRaftCluster implements Closeable {
     LOG.info("************************************************************** ");
     LOG.info(printServers());
 
+    // TODO: classes like RaftLog may throw uncaught exception during shutdown (e.g. write after close)
+    ExitUtils.setTerminateOnUncaughtException(false);
+
     final ExecutorService executor = Executors.newFixedThreadPool(servers.size(), Daemon::new);
     getServers().forEach(proxy -> executor.submit(proxy::close));
     try {
@@ -590,7 +728,7 @@ public abstract class MiniRaftCluster implements Closeable {
       LOG.warn("shutdown interrupted", e);
     }
 
-    timer.cancel();
+    Optional.ofNullable(timer.get()).ifPresent(Timer::cancel);
     ExitUtils.assertNotTerminated();
     LOG.info(getClass().getSimpleName() + " shutdown completed");
   }
@@ -619,7 +757,7 @@ public abstract class MiniRaftCluster implements Closeable {
     // vote, all non-leader servers can grant the vote.
     // Disable the target leader server RPC so that it can request a vote.
     blockQueueAndSetDelay(leaderId,
-        RaftServerConfigKeys.Rpc.TIMEOUT_MIN_DEFAULT.toInt(TimeUnit.MILLISECONDS));
+        RaftServerConfigKeys.Rpc.TIMEOUT_MIN_DEFAULT.toIntExact(TimeUnit.MILLISECONDS));
 
     // Reopen queues so that the vote can make progress.
     blockQueueAndSetDelay(leaderId, 0);

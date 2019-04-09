@@ -183,9 +183,9 @@ class StateMachineUpdater implements Runnable {
           if (futures.isInitialized()) {
             JavaUtils.allOf(futures.get()).get();
           }
-          stateMachine.takeSnapshot();
+          long lastSnapshotIndex = stateMachine.takeSnapshot();
+          raftLog.purge(lastSnapshotIndex);
           // TODO purge logs, including log cache. but should keep log for leader's RPCSenders
-          lastSnapshotIndex = lastAppliedIndex;
         }
 
         if (shouldStop()) {

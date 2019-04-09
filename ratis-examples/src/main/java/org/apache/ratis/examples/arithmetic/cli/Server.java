@@ -21,6 +21,7 @@ import com.beust.jcommander.Parameter;
 import com.beust.jcommander.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.examples.arithmetic.ArithmeticStateMachine;
+import org.apache.ratis.examples.common.SubCommandBase;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
@@ -28,13 +29,15 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.statemachine.StateMachine;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.NetUtils;
 
 import java.io.File;
 import java.util.Collections;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Class to start a ratis arithmetic example server.
@@ -70,6 +73,10 @@ public class Server extends SubCommandBase {
         .setGroup(raftGroup)
         .build();
     raftServer.start();
+
+    for(; raftServer.getLifeCycleState() != LifeCycle.State.CLOSED;) {
+      TimeUnit.SECONDS.sleep(1);
+    }
   }
 
   /**
@@ -84,6 +91,4 @@ public class Server extends SubCommandBase {
     }
     throw new IllegalArgumentException("Raft peer id " + id + " is not part of the raft group definitions " + peers);
   }
-
-
 }

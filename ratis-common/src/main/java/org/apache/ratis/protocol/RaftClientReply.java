@@ -67,8 +67,8 @@ public class RaftClientReply extends RaftClientMessage {
       Preconditions.assertTrue(!success,
           () -> "Inconsistent parameters: success && exception != null: " + this);
       Preconditions.assertTrue(ReflectionUtils.isInstance(exception,
-          NotLeaderException.class, NotReplicatedException.class, StateMachineException.class),
-          () -> "Unexpected exception class: " + this);
+          NotLeaderException.class, NotReplicatedException.class, StateMachineException.class,
+          RaftRetryFailureException.class), () -> "Unexpected exception class: " + this);
     }
   }
 
@@ -86,9 +86,10 @@ public class RaftClientReply extends RaftClientMessage {
         request.getCallId(), true, message, null, 0L, commitInfos);
   }
 
-  public RaftClientReply(RaftClientReply reply, NotReplicatedException nre) {
-    this(reply.getClientId(), reply.getServerId(), reply.getRaftGroupId(),
-        reply.getCallId(), false, reply.getMessage(), nre, reply.getLogIndex(), reply.getCommitInfos());
+  public RaftClientReply(RaftClientRequest request, NotReplicatedException nre,
+      Collection<CommitInfoProto> commitInfos) {
+    this(request.getClientId(), request.getServerId(), request.getRaftGroupId(),
+        request.getCallId(), false, request.getMessage(), nre, nre.getLogIndex(), commitInfos);
   }
 
   /**
@@ -142,5 +143,10 @@ public class RaftClientReply extends RaftClientMessage {
   /** If this reply has {@link StateMachineException}, return it; otherwise return null. */
   public StateMachineException getStateMachineException() {
     return JavaUtils.cast(exception, StateMachineException.class);
+  }
+
+  /** If this reply has {@link RaftRetryFailureException}, return it; otherwise return null. */
+  public RaftRetryFailureException getRetryFailureException() {
+    return JavaUtils.cast(exception, RaftRetryFailureException.class);
   }
 }

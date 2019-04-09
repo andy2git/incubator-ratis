@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -25,6 +25,7 @@ import org.apache.ratis.server.impl.ServerProtoUtils;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.storage.LogSegment.LogRecord;
 import org.apache.ratis.server.storage.LogSegment.LogRecordWithEntry;
+import org.apache.ratis.server.storage.RaftLogCache.TruncateIndices;
 import org.apache.ratis.server.storage.RaftStorageDirectory.LogPathAndIndex;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
 import org.apache.ratis.statemachine.StateMachine;
@@ -34,11 +35,10 @@ import org.apache.ratis.util.Preconditions;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
@@ -88,17 +88,22 @@ public class SegmentedRaftLog extends RaftLog {
 
     abstract long getEndIndex();
 
+    int getSerializedSize() {
+      return 0;
+    }
+
     @Override
     public String toString() {
       return getClass().getSimpleName() + ":" + getEndIndex();
     }
   }
 
-  private final RaftServerImpl server;
+  private final Optional<RaftServerImpl> server;
   private final RaftStorage storage;
   private final RaftLogCache cache;
   private final RaftLogWorker fileLogWorker;
   private final long segmentMaxSize;
+  private final boolean stateMachineCachingEnabled;
 
   public SegmentedRaftLog(RaftPeerId selfId, RaftServerImpl server,
       RaftStorage storage, long lastIndexInSnapshot, RaftProperties properties) {
@@ -110,19 +115,17 @@ public class SegmentedRaftLog extends RaftLog {
   SegmentedRaftLog(RaftPeerId selfId, RaftServerImpl server,
       StateMachine stateMachine, Runnable submitUpdateCommitEvent,
       RaftStorage storage, long lastIndexInSnapshot, RaftProperties properties) {
-    super(selfId, RaftServerConfigKeys.Log.Appender.bufferCapacity(properties)
-        .getSizeInt());
-    this.server = server;
+    super(selfId, lastIndexInSnapshot, RaftServerConfigKeys.Log.Appender.bufferByteLimit(properties).getSizeInt());
+    this.server = Optional.ofNullable(server);
     this.storage = storage;
     segmentMaxSize = RaftServerConfigKeys.Log.segmentSizeMax(properties).getSize();
     cache = new RaftLogCache(selfId, storage, properties);
     this.fileLogWorker = new RaftLogWorker(selfId, stateMachine, submitUpdateCommitEvent, storage, properties);
-    lastCommitted.set(lastIndexInSnapshot);
+    stateMachineCachingEnabled = RaftServerConfigKeys.Log.StateMachineData.cachingEnabled(properties);
   }
 
   @Override
-  public void open(long lastIndexInSnapshot, Consumer<LogEntryProto> consumer)
-      throws IOException {
+  protected void openImpl(long lastIndexInSnapshot, Consumer<LogEntryProto> consumer) throws IOException {
     loadLogSegments(lastIndexInSnapshot, consumer);
     File openSegmentFile = null;
     LogSegment openSegment = cache.getOpenSegment();
@@ -132,7 +135,6 @@ public class SegmentedRaftLog extends RaftLog {
     }
     fileLogWorker.start(Math.max(cache.getEndIndex(), lastIndexInSnapshot),
         openSegmentFile);
-    super.open(lastIndexInSnapshot, consumer);
   }
 
   @Override
@@ -203,9 +205,9 @@ public class SegmentedRaftLog extends RaftLog {
     }
 
     try {
-      return new EntryWithData(entry, server.getStateMachine().readStateMachineData(entry));
+      return new EntryWithData(entry, server.map(s -> s.getStateMachine().readStateMachineData(entry)).orElse(null));
     } catch (Throwable e) {
-      final String err = server.getId() + ": Failed readStateMachineData for " +
+      final String err = getSelfId() + ": Failed readStateMachineData for " +
           ServerProtoUtils.toLogEntryString(entry);
       LOG.error(err, e);
       throw new RaftLogIOException(err, JavaUtils.unwrapCompletionException(e));
@@ -213,13 +215,12 @@ public class SegmentedRaftLog extends RaftLog {
   }
 
   private void checkAndEvictCache() {
-    if (server != null && cache.shouldEvict()) {
+    if (server.isPresent() && cache.shouldEvict()) {
       // TODO if the cache is hitting the maximum size and we cannot evict any
       // segment's cache, should block the new entry appending or new segment
       // allocation.
-      cache.evictCache(server.getFollowerNextIndices(),
-          fileLogWorker.getFlushedIndex(),
-          server.getState().getLastAppliedIndex());
+      final RaftServerImpl s = server.get();
+      cache.evictCache(s.getFollowerNextIndices(), fileLogWorker.getFlushedIndex(), s.getState().getLastAppliedIndex());
     }
   }
 
@@ -253,12 +254,26 @@ public class SegmentedRaftLog extends RaftLog {
    * {@link #append(LogEntryProto...)} need protection of RaftServer's lock.
    */
   @Override
-  CompletableFuture<Long> truncate(long index) {
+  CompletableFuture<Long> truncateImpl(long index) {
     checkLogState();
     try(AutoCloseableLock writeLock = writeLock()) {
       RaftLogCache.TruncationSegments ts = cache.truncate(index);
       if (ts != null) {
-        Task task = fileLogWorker.truncate(ts);
+        Task task = fileLogWorker.truncate(ts, index);
+        return task.getFuture();
+      }
+    }
+    return CompletableFuture.completedFuture(index);
+  }
+
+
+  @Override
+  public CompletableFuture<Long> purgeImpl(long index) {
+    try (AutoCloseableLock writeLock = writeLock()) {
+      RaftLogCache.TruncationSegments ts = cache.purge(index);
+      LOG.debug("truncating segments:{}", ts);
+      if (ts != null) {
+        Task task = fileLogWorker.purge(ts);
         return task.getFuture();
       }
     }
@@ -266,11 +281,10 @@ public class SegmentedRaftLog extends RaftLog {
   }
 
   @Override
-  CompletableFuture<Long> appendEntry(LogEntryProto entry) {
-
+  CompletableFuture<Long> appendEntryImpl(LogEntryProto entry) {
     checkLogState();
     if (LOG.isTraceEnabled()) {
-      LOG.trace("{}: appendEntry {}", server.getId(),
+      LOG.trace("{}: appendEntry {}", getSelfId(),
           ServerProtoUtils.toLogEntryString(entry));
     }
     try(AutoCloseableLock writeLock = writeLock()) {
@@ -300,11 +314,15 @@ public class SegmentedRaftLog extends RaftLog {
       // will leave a spurious entry in the cache.
       CompletableFuture<Long> writeFuture =
           fileLogWorker.writeLogEntry(entry).getFuture();
-      cache.appendEntry(entry);
+      if (stateMachineCachingEnabled) {
+        // The stateMachineData will be cached inside the StateMachine itself.
+        cache.appendEntry(ServerProtoUtils.removeStateMachineData(entry));
+      } else {
+        cache.appendEntry(entry);
+      }
       return writeFuture;
     } catch (Throwable throwable) {
-      LOG.error(getSelfId() + "exception while appending entry with index:" +
-          entry.getIndex(), throwable);
+      LOG.error(getSelfId() + ": Failed to append " + ServerProtoUtils.toLogEntryString(entry), throwable);
       throw throwable;
     }
   }
@@ -321,52 +339,29 @@ public class SegmentedRaftLog extends RaftLog {
     }
   }
 
-  @Override
-  public List<CompletableFuture<Long>> append(LogEntryProto... entries) {
+  private void failClientRequest(TermIndex ti) {
+    if (!server.isPresent()) {
+      return;
+    }
+    try {
+      final LogEntryProto entry = get(ti.getIndex());
+      server.get().failClientRequest(entry);
+    } catch(RaftLogIOException e) {
+      LOG.error(getName() + ": Failed to read log " + ti, e);
+    }
+  }
 
+  @Override
+  public List<CompletableFuture<Long>> appendImpl(LogEntryProto... entries) {
     checkLogState();
     if (entries == null || entries.length == 0) {
       return Collections.emptyList();
     }
-
     try(AutoCloseableLock writeLock = writeLock()) {
-      Iterator<TermIndex> iter = cache.iterator(entries[0].getIndex());
-      int index = 0;
-      long truncateIndex = -1;
-      for (; iter.hasNext() && index < entries.length; index++) {
-        TermIndex storedEntry = iter.next();
-        Preconditions.assertTrue(
-            storedEntry.getIndex() == entries[index].getIndex(),
-            "The stored entry's index %s is not consistent with" +
-                " the received entries[%s]'s index %s", storedEntry.getIndex(),
-            index, entries[index].getIndex());
-
-        if (storedEntry.getTerm() != entries[index].getTerm()) {
-          // we should truncate from the storedEntry's index
-          truncateIndex = storedEntry.getIndex();
-          if (LOG.isTraceEnabled()) {
-            LOG.trace("{}: truncate to {}, index={}, ti={}, storedEntry={}, entries={}",
-                server.getId(), truncateIndex, index,
-                ServerProtoUtils.toTermIndex(entries[index]), storedEntry,
-                ServerProtoUtils.toString(entries));
-          }
-          while (true) {
-            try {
-              final LogEntryProto entry = get(storedEntry.getIndex());
-              server.failClientRequest(entry);
-            } catch (RaftLogIOException e) {
-              LOG.error("Failed to read log " + storedEntry, e);
-            }
-
-            if (iter.hasNext()) {
-              storedEntry = iter.next();
-            } else {
-              break;
-            }
-          }
-          break;
-        }
-      }
+      final TruncateIndices ti = cache.computeTruncateIndices(this::failClientRequest, entries);
+      final long truncateIndex = ti.getTruncateIndex();
+      final int index = ti.getArrayIndex();
+      LOG.debug("truncateIndex={}, arrayIndex={}", truncateIndex, index);
 
       final List<CompletableFuture<Long>> futures;
       if (truncateIndex != -1) {
@@ -431,5 +426,17 @@ public class SegmentedRaftLog extends RaftLog {
 
   RaftLogCache getRaftLogCache() {
     return cache;
+  }
+
+  @Override
+  public String toString() {
+    try(AutoCloseableLock readLock = readLock()) {
+      if (isOpened()) {
+        return super.toString() + ",f" + getLatestFlushedIndex()
+            + ",i" + Optional.ofNullable(getLastEntryTermIndex()).map(TermIndex::getIndex).orElse(0L);
+      } else {
+        return super.toString();
+      }
+    }
   }
 }

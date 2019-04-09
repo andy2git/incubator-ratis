@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,6 +17,7 @@
  */
 package org.apache.ratis.util;
 
+import org.apache.ratis.util.function.CheckedRunnable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -83,7 +84,7 @@ public final class TimeoutScheduler {
       try {
         task.run();
       } catch(Throwable t) {
-        errorHandler.accept((THROWABLE) t);
+        errorHandler.accept(JavaUtils.cast(t));
       } finally {
         onTaskCompleted();
       }

@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -39,7 +39,6 @@ import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
 import org.apache.ratis.statemachine.impl.SingleFileSnapshotInfo;
-import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.util.Daemon;
 import org.apache.ratis.util.JavaUtils;
@@ -155,7 +154,9 @@ public class SimpleStateMachine4Testing extends BaseStateMachine {
     Preconditions.assertNull(previous, "previous");
     final String s = entry.getStateMachineLogEntry().getLogData().toStringUtf8();
     dataMap.put(s, entry);
-    LOG.info("put {}, {} -> {}", entry.getIndex(), s, ServerProtoUtils.toLogEntryString(entry));
+    LOG.info("{}: put {}, {} -> {}", getId(), entry.getIndex(),
+        s.length() <= 10? s: s.substring(0, 10) + "...",
+        ServerProtoUtils.toLogEntryString(entry));
   }
 
   @Override
@@ -291,7 +292,7 @@ public class SimpleStateMachine4Testing extends BaseStateMachine {
       if (entry != null) {
         return CompletableFuture.completedFuture(Message.valueOf(entry.toByteString()));
       }
-      exception = new IndexOutOfBoundsException("Log entry not found for query " + string);
+      exception = new IndexOutOfBoundsException(getId() + ": LogEntry not found for query " + string);
     } catch (Exception e) {
       LOG.warn("Failed request " + request, e);
       exception = e;
@@ -303,10 +304,13 @@ public class SimpleStateMachine4Testing extends BaseStateMachine {
   static final ByteString STATE_MACHINE_DATA = ByteString.copyFromUtf8("StateMachine Data");
 
   @Override
-  public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
+  public TransactionContext startTransaction(RaftClientRequest request) {
     blocking.await(Blocking.Type.START_TRANSACTION);
-    return new TransactionContextImpl(this, request,
-        ServerProtoUtils.toStateMachineLogEntryProto(request, null, STATE_MACHINE_DATA));
+    return TransactionContext.newBuilder()
+        .setStateMachine(this)
+        .setClientRequest(request)
+        .setStateMachineData(STATE_MACHINE_DATA)
+        .build();
   }
 
   @Override

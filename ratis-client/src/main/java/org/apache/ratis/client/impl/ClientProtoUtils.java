@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -24,6 +24,7 @@ import org.apache.ratis.util.ProtoUtils;
 import org.apache.ratis.util.ReflectionUtils;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.apache.ratis.proto.RaftProtos.RaftClientReplyProto.ExceptionDetailsCase.NOTLEADEREXCEPTION;
@@ -44,19 +45,24 @@ public interface ClientProtoUtils {
   }
 
   static RaftRpcRequestProto.Builder toRaftRpcRequestProtoBuilder(
-      ByteString requesterId, ByteString replyId, RaftGroupId groupId, long callId, long seqNum) {
+      ByteString requesterId, ByteString replyId, RaftGroupId groupId, long callId,
+      SlidingWindowEntry slidingWindowEntry) {
+    if (slidingWindowEntry == null) {
+      slidingWindowEntry = SlidingWindowEntry.getDefaultInstance();
+    }
     return RaftRpcRequestProto.newBuilder()
         .setRequestorId(requesterId)
         .setReplyId(replyId)
         .setRaftGroupId(ProtoUtils.toRaftGroupIdProtoBuilder(groupId))
         .setCallId(callId)
-        .setSeqNum(seqNum);
+        .setSlidingWindowEntry(slidingWindowEntry);
   }
 
   static RaftRpcRequestProto.Builder toRaftRpcRequestProtoBuilder(
-      ClientId requesterId, RaftPeerId replyId, RaftGroupId groupId, long callId, long seqNum) {
+      ClientId requesterId, RaftPeerId replyId, RaftGroupId groupId, long callId,
+      SlidingWindowEntry slidingWindowEntry) {
     return toRaftRpcRequestProtoBuilder(
-        requesterId.toByteString(), replyId.toByteString(), groupId, callId, seqNum);
+        requesterId.toByteString(), replyId.toByteString(), groupId, callId, slidingWindowEntry);
   }
 
   static RaftRpcRequestProto.Builder toRaftRpcRequestProtoBuilder(
@@ -66,7 +72,7 @@ public interface ClientProtoUtils {
         request.getServerId(),
         request.getRaftGroupId(),
         request.getCallId(),
-        request.getSeqNum());
+        request.getSlidingWindowEntry());
   }
 
   static RaftClientRequest.Type toRaftClientRequestType(RaftClientRequestProto p) {
@@ -93,9 +99,9 @@ public interface ClientProtoUtils {
         RaftPeerId.valueOf(request.getReplyId()),
         ProtoUtils.toRaftGroupId(request.getRaftGroupId()),
         request.getCallId(),
-        request.getSeqNum(),
         toMessage(p.getMessage()),
-        type);
+        type,
+        request.getSlidingWindowEntry());
   }
 
   static RaftClientRequestProto toRaftClientRequestProto(
@@ -133,7 +139,7 @@ public interface ClientProtoUtils {
       long seqNum, ByteString content) {
     return RaftClientRequestProto.newBuilder()
         .setRpcRequest(toRaftRpcRequestProtoBuilder(
-            clientId, serverId, groupId, callId, seqNum))
+            clientId, serverId, groupId, callId, ProtoUtils.toSlidingWindowEntry(seqNum, false)))
         .setWrite(WriteRequestTypeProto.getDefaultInstance())
         .setMessage(toClientMessageEntryProtoBuilder(content))
         .build();
@@ -158,7 +164,7 @@ public interface ClientProtoUtils {
             NotLeaderExceptionProto.newBuilder();
         final RaftPeer suggestedLeader = nle.getSuggestedLeader();
         if (suggestedLeader != null) {
-          nleBuilder.setSuggestedLeader(ProtoUtils.toRaftPeerProto(suggestedLeader));
+          nleBuilder.setSuggestedLeader(suggestedLeader.getRaftPeerProto());
         }
         nleBuilder.addAllPeersInConf(
             ProtoUtils.toRaftPeerProtos(Arrays.asList(nle.getPeers())));
@@ -253,8 +259,9 @@ public interface ClientProtoUtils {
     final RaftRpcReplyProto rp = replyProto.getRpcReply();
     ClientId clientId = ClientId.valueOf(rp.getRequestorId());
     final RaftGroupId groupId = ProtoUtils.toRaftGroupId(rp.getRaftGroupId());
-    final Iterable<RaftGroupId> groupInfos = replyProto.getGroupIdList().stream()
-        .map(id -> ProtoUtils.toRaftGroupId(id)).collect(Collectors.toList());
+    final List<RaftGroupId> groupInfos = replyProto.getGroupIdList().stream()
+        .map(ProtoUtils::toRaftGroupId)
+        .collect(Collectors.toList());
     return new GroupListReply(clientId, RaftPeerId.valueOf(rp.getReplyId()),
         groupId, rp.getCallId(), rp.getSuccess(), groupInfos);
   }
@@ -399,7 +406,7 @@ public interface ClientProtoUtils {
   static String toString(RaftClientRequestProto proto) {
     final RaftRpcRequestProto rpc = proto.getRpcRequest();
     return ClientId.valueOf(rpc.getRequestorId()) + "->" + rpc.getReplyId().toStringUtf8()
-        + "#" + rpc.getCallId() + "-" + rpc.getSeqNum();
+        + "#" + rpc.getCallId() + "-" + ProtoUtils.toString(rpc.getSlidingWindowEntry());
   }
 
   static String toString(RaftClientReplyProto proto) {
@@ -407,5 +414,4 @@ public interface ClientProtoUtils {
     return ClientId.valueOf(rpc.getRequestorId()) + "<-" + rpc.getReplyId().toStringUtf8()
         + "#" + rpc.getCallId();
   }
-
 }

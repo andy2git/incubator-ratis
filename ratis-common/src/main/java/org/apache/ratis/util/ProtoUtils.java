@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,7 +17,6 @@
  */
 package org.apache.ratis.util;
 
-import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto;
 import org.apache.ratis.proto.RaftProtos.CommitInfoProto;
 import org.apache.ratis.proto.RaftProtos.RaftGroupIdProto;
 import org.apache.ratis.proto.RaftProtos.RaftGroupProto;
@@ -25,6 +24,7 @@ import org.apache.ratis.proto.RaftProtos.RaftPeerProto;
 import org.apache.ratis.proto.RaftProtos.RaftRpcReplyProto;
 import org.apache.ratis.proto.RaftProtos.RaftRpcRequestProto;
 import org.apache.ratis.proto.RaftProtos.RequestVoteReplyProto;
+import org.apache.ratis.proto.RaftProtos.SlidingWindowEntry;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
@@ -33,7 +33,6 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.com.google.protobuf.ServiceException;
 
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.util.Collection;
 import java.util.Iterator;
@@ -54,14 +53,7 @@ public interface ProtoUtils {
   }
 
   static Object toObject(ByteString bytes) {
-    try(final ObjectInputStream in = new ObjectInputStream(bytes.newInput())) {
-      return in.readObject();
-    } catch (IOException e) {
-      throw new IllegalStateException(
-          "Unexpected IOException when reading an object from a ByteString.", e);
-    } catch (ClassNotFoundException e) {
-      throw new IllegalStateException(e);
-    }
+    return IOUtils.readObject(bytes.newInput(), Object.class);
   }
 
   static ByteString toByteString(String string) {
@@ -76,15 +68,6 @@ public interface ProtoUtils {
     // return singleton to reduce object allocation
     return bytes.length == 0 ?
         ByteString.EMPTY : ByteString.copyFrom(bytes, offset, size);
-  }
-
-  static RaftPeerProto toRaftPeerProto(RaftPeer peer) {
-    RaftPeerProto.Builder builder = RaftPeerProto.newBuilder()
-        .setId(peer.getId().toByteString());
-    if (peer.getAddress() != null) {
-      builder.setAddress(peer.getAddress());
-    }
-    return builder.build();
   }
 
   static RaftPeer toRaftPeer(RaftPeerProto p) {
@@ -111,7 +94,7 @@ public interface ProtoUtils {
 
       @Override
       public RaftPeerProto next() {
-        return toRaftPeerProto(i.next());
+        return i.next().getRaftPeerProto();
       }
     };
   }
@@ -136,14 +119,14 @@ public interface ProtoUtils {
 
   static CommitInfoProto toCommitInfoProto(RaftPeer peer, long commitIndex) {
     return CommitInfoProto.newBuilder()
-        .setServer(toRaftPeerProto(peer))
+        .setServer(peer.getRaftPeerProto())
         .setCommitIndex(commitIndex)
         .build();
   }
 
-  static void addCommitInfos(Collection<CommitInfoProto> commitInfos, Consumer<CommitInfoProto> adder) {
+  static void addCommitInfos(Collection<CommitInfoProto> commitInfos, Consumer<CommitInfoProto> accumulator) {
     if (commitInfos != null && !commitInfos.isEmpty()) {
-      commitInfos.stream().forEach(i -> adder.accept(i));
+      commitInfos.forEach(accumulator);
     }
   }
 
@@ -153,6 +136,14 @@ public interface ProtoUtils {
 
   static String toString(Collection<CommitInfoProto> protos) {
     return protos.stream().map(ProtoUtils::toString).collect(Collectors.toList()).toString();
+  }
+
+  static SlidingWindowEntry toSlidingWindowEntry(long seqNum, boolean isFirst) {
+    return SlidingWindowEntry.newBuilder().setSeqNum(seqNum).setIsFirst(isFirst).build();
+  }
+
+  static String toString(SlidingWindowEntry proto) {
+    return proto.getSeqNum() + (proto.getIsFirst()? "*": "");
   }
 
   static IOException toIOException(ServiceException se) {
@@ -175,10 +166,5 @@ public interface ProtoUtils {
   }
   static String toString(RequestVoteReplyProto proto) {
     return toString(proto.getServerReply()) + "-t" + proto.getTerm();
-  }
-  static String toString(AppendEntriesReplyProto proto) {
-    return toString(proto.getServerReply()) + "-t" + proto.getTerm()
-        + ", nextIndex=" + proto.getNextIndex()
-        + ", result: " + proto.getResult();
   }
 }

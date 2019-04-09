@@ -30,6 +30,7 @@ import org.apache.ratis.logservice.proto.LogServiceProtos.*;
 import org.apache.ratis.logservice.util.LogServiceProtoUtil;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
+import org.apache.ratis.thirdparty.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,6 +68,7 @@ public class LogReaderImpl implements LogReader {
 
   @Override
   public void seek(long recordId) throws IOException {
+    Preconditions.checkArgument(recordId >= 0, "recordId must be >= 0");
     this.currentRecordId = recordId;
   }
 
@@ -99,11 +101,11 @@ public class LogReaderImpl implements LogReader {
 
   @Override
   public void readNext(ByteBuffer buffer) throws IOException {
+
+    Preconditions.checkNotNull(buffer, "buffer is NULL" );
     try {
-      RaftClientReply reply =
-          raftClient
-              .sendReadOnly(Message.valueOf(LogServiceProtoUtil
-                  .toReadLogRequestProto(parent.getName(), currentRecordId, 1).toByteString()));
+      RaftClientReply reply = raftClient.sendReadOnly(Message.valueOf(LogServiceProtoUtil
+          .toReadLogRequestProto(parent.getName(), currentRecordId, 1).toByteString()));
       ReadLogReplyProto proto = ReadLogReplyProto.parseFrom(reply.getMessage().getContent());
       if (proto.hasException()) {
         LogServiceException e = proto.getException();
@@ -121,6 +123,7 @@ public class LogReaderImpl implements LogReader {
 
   @Override
   public List<ByteBuffer> readBulk(int numRecords) throws IOException {
+		Preconditions.checkArgument(numRecords > 0, "number of records must be greater than 0");
 
     try {
       RaftClientReply reply = raftClient
@@ -146,10 +149,13 @@ public class LogReaderImpl implements LogReader {
   }
 
   @Override
-  public int readBulk(List<ByteBuffer> buffers) throws IOException {
+  public int readBulk(ByteBuffer[] buffers) throws IOException {
+    Preconditions.checkNotNull(buffers, "list of buffers is NULL" );
+    Preconditions.checkArgument(buffers.length > 0, "list of buffers is empty");
+
     try {
       RaftClientReply reply = raftClient.sendReadOnly(Message.valueOf(LogServiceProtoUtil
-          .toReadLogRequestProto(parent.getName(), currentRecordId, buffers.size()).toByteString()));
+          .toReadLogRequestProto(parent.getName(), currentRecordId, buffers.length).toByteString()));
       ReadLogReplyProto proto = ReadLogReplyProto.parseFrom(reply.getMessage().getContent());
       if (proto.hasException()) {
         LogServiceException e = proto.getException();
@@ -159,7 +165,7 @@ public class LogReaderImpl implements LogReader {
       int n = proto.getLogRecordCount();
       currentRecordId += n;
       for (int i = 0; i < n; i++) {
-        buffers.get(i).put(proto.getLogRecord(i).toByteArray());
+        buffers[i] = ByteBuffer.wrap(proto.getLogRecord(i).toByteArray());
       }
       return n;
     } catch (Exception e) {

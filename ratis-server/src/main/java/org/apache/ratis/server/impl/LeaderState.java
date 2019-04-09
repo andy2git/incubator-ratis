@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -35,12 +35,14 @@ import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.function.Predicate;
+import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
-import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 /**
@@ -198,11 +200,11 @@ public class LeaderState {
     this.currentTerm = state.getCurrentTerm();
     processor = new EventProcessor();
     this.pendingRequests = new PendingRequests(server.getId());
-    this.watchRequests = new WatchRequests(server);
+    this.watchRequests = new WatchRequests(server.getId(), properties);
 
     final RaftConfiguration conf = server.getRaftConf();
     Collection<RaftPeer> others = conf.getOtherPeers(state.getSelfId());
-    final Timestamp t = new Timestamp().addTimeMs(-server.getMaxTimeoutMs());
+    final Timestamp t = Timestamp.currentTime().addTimeMs(-server.getMaxTimeoutMs());
     placeHolderIndex = raftLog.getNextIndex();
 
     senders = new SenderList(others.stream().map(
@@ -244,6 +246,7 @@ public class LeaderState {
     } catch (IOException e) {
       LOG.warn(server.getId() + ": Caught exception in sendNotLeaderResponses", e);
     }
+    server.getServerRpc().notifyNotLeader();
   }
 
   void notifySenders() {
@@ -290,30 +293,39 @@ public class LeaderState {
     return pending;
   }
 
-  PendingRequest addPendingRequest(long index, RaftClientRequest request,
-      TransactionContext entry) {
-    LOG.debug("{}: addPendingRequest at index={}, request={}", server.getId(), index, request);
-    return pendingRequests.addPendingRequest(index, request, entry);
+  PendingRequest addPendingRequest(RaftClientRequest request, TransactionContext entry) {
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("{}: addPendingRequest at {}, entry=", server.getId(), request,
+          ServerProtoUtils.toLogEntryString(entry.getLogEntry()));
+    }
+    return pendingRequests.add(request, entry);
   }
 
-  CompletableFuture<Void> addWatchReqeust(RaftClientRequest request) {
+  CompletableFuture<RaftClientReply> addWatchReqeust(RaftClientRequest request) {
     LOG.debug("{}: addWatchRequest {}", server.getId(), request);
-    return watchRequests.add(request.getType().getWatch());
+    return watchRequests.add(request)
+        .thenApply(v -> new RaftClientReply(request, server.getCommitInfos()))
+        .exceptionally(e -> {
+          e = JavaUtils.unwrapCompletionException(e);
+          if (e instanceof NotReplicatedException) {
+            return new RaftClientReply(request, (NotReplicatedException)e, server.getCommitInfos());
+          } else if (e instanceof NotLeaderException) {
+            return new RaftClientReply(request, (NotLeaderException)e, server.getCommitInfos());
+          } else {
+            throw new CompletionException(e);
+          }
+        });
   }
 
   void commitIndexChanged() {
-    final long[] commitIndices = LongStream.concat(LongStream.of(
-        raftLog.getLastCommittedIndex()), senders.stream()
-        .map(LogAppender::getFollower)
-        .mapToLong(FollowerInfo::getCommitIndex))
-        .sorted().toArray();
-
-    // Normally, leader commit index is always ahead followers.
-    // However, after a leader change, the new leader commit index may
-    // be behind some followers in the beginning.
-    watchRequests.update(ReplicationLevel.MAJORITY, commitIndices[commitIndices.length-1]);
-    watchRequests.update(ReplicationLevel.ALL_COMMITTED, commitIndices[0]);
-    watchRequests.update(ReplicationLevel.MAJORITY_COMMITTED, getMajority(commitIndices));
+    getMajorityMin(FollowerInfo::getCommitIndex, raftLog::getLastCommittedIndex).ifPresent(m -> {
+      // Normally, leader commit index is always ahead followers.
+      // However, after a leader change, the new leader commit index may
+      // be behind some followers in the beginning.
+      watchRequests.update(ReplicationLevel.ALL_COMMITTED, m.min);
+      watchRequests.update(ReplicationLevel.MAJORITY_COMMITTED, m.majority);
+      watchRequests.update(ReplicationLevel.MAJORITY, m.max);
+    });
   }
 
   private void applyOldNewConf() {
@@ -353,7 +365,7 @@ public class LeaderState {
    * RpcSender list.
    */
   void addSenders(Collection<RaftPeer> newMembers) {
-    final Timestamp t = new Timestamp().addTimeMs(-server.getMaxTimeoutMs());
+    final Timestamp t = Timestamp.currentTime().addTimeMs(-server.getMaxTimeoutMs());
     final long nextIndex = raftLog.getNextIndex();
 
     senders.addAll(newMembers.stream().map(peer -> {
@@ -387,7 +399,7 @@ public class LeaderState {
 
   private void stepDown(long term) {
     try {
-      server.changeToFollowerAndPersistMetadata(term);
+      server.changeToFollowerAndPersistMetadata(term, "stepDown");
     } catch(IOException e) {
       final String s = server.getId() + ": Failed to persist metadata for term " + term;
       LOG.warn(s, e);
@@ -450,8 +462,8 @@ public class LeaderState {
   private BootStrapProgress checkProgress(FollowerInfo follower,
       long committed) {
     Preconditions.assertTrue(!follower.isAttendingVote());
-    final Timestamp progressTime = new Timestamp().addTimeMs(-server.getMaxTimeoutMs());
-    final Timestamp timeoutTime = new Timestamp().addTimeMs(-3*server.getMaxTimeoutMs());
+    final Timestamp progressTime = Timestamp.currentTime().addTimeMs(-server.getMaxTimeoutMs());
+    final Timestamp timeoutTime = Timestamp.currentTime().addTimeMs(-3*server.getMaxTimeoutMs());
     if (follower.getLastRpcResponseTime().compareTo(timeoutTime) < 0) {
       LOG.debug("{} detects a follower {} timeout for bootstrapping," +
               " timeoutTime: {}", server.getId(), follower, timeoutTime);
@@ -503,37 +515,71 @@ public class LeaderState {
     eventQueue.submit(UPDATE_COMMIT_EVENT);
   }
 
+  static class MinMajorityMax {
+    private final long min;
+    private final long majority;
+    private final long max;
+
+    MinMajorityMax(long min, long majority, long max) {
+      this.min = min;
+      this.majority = majority;
+      this.max = max;
+    }
+
+    MinMajorityMax combine(MinMajorityMax that) {
+      return new MinMajorityMax(
+          Math.min(this.min, that.min),
+          Math.min(this.majority, that.majority),
+          Math.min(this.max, that.max));
+    }
+
+    static MinMajorityMax valueOf(long[] sorted) {
+      return new MinMajorityMax(sorted[0], getMajority(sorted), getMax(sorted));
+    }
+
+    static long getMajority(long[] sorted) {
+      return sorted[(sorted.length - 1) / 2];
+    }
+
+    static long getMax(long[] sorted) {
+      return sorted[sorted.length - 1];
+    }
+  }
+
   private void updateCommit() {
+    getMajorityMin(FollowerInfo::getMatchIndex, raftLog::getLatestFlushedIndex)
+        .ifPresent(m -> updateCommit(m.majority, m.min));
+  }
+
+  private Optional<MinMajorityMax> getMajorityMin(ToLongFunction<FollowerInfo> followerIndex, LongSupplier logIndex) {
     final RaftPeerId selfId = server.getId();
     final RaftConfiguration conf = server.getRaftConf();
 
     final List<FollowerInfo> followers = voterLists.get(0);
     final boolean includeSelf = conf.containsInConf(selfId);
     if (followers.isEmpty() && !includeSelf) {
-      return;
+      return Optional.empty();
     }
 
-    final long[] indicesInNewConf = getSortedLogIndices(followers, includeSelf);
-    final long majorityInNewConf = getMajority(indicesInNewConf);
-    final long majority;
-    final long min;
+    final long[] indicesInNewConf = getSorted(followers, includeSelf, followerIndex, logIndex);
+    final MinMajorityMax newConf = MinMajorityMax.valueOf(indicesInNewConf);
 
     if (!conf.isTransitional()) {
-      majority = majorityInNewConf;
-      min = indicesInNewConf[0];
+      return Optional.of(newConf);
     } else { // configuration is in transitional state
       final List<FollowerInfo> oldFollowers = voterLists.get(1);
       final boolean includeSelfInOldConf = conf.containsInOldConf(selfId);
       if (oldFollowers.isEmpty() && !includeSelfInOldConf) {
-        return;
+        return Optional.empty();
       }
 
-      final long[] indicesInOldConf = getSortedLogIndices(oldFollowers, includeSelfInOldConf);
-      final long majorityInOldConf = getMajority(indicesInOldConf);
-      majority = Math.min(majorityInNewConf, majorityInOldConf);
-      min = Math.min(indicesInNewConf[0], indicesInOldConf[0]);
+      final long[] indicesInOldConf = getSorted(oldFollowers, includeSelfInOldConf, followerIndex, logIndex);
+      final MinMajorityMax oldConf = MinMajorityMax.valueOf(indicesInOldConf);
+      return Optional.of(newConf.combine(oldConf));
     }
+  }
 
+  private void updateCommit(long majority, long min) {
     final long oldLastCommitted = raftLog.getLastCommittedIndex();
     if (majority > oldLastCommitted) {
       // copy the entries out from the raftlog, in order to prevent that
@@ -542,13 +588,18 @@ public class LeaderState {
           oldLastCommitted + 1, majority + 1);
       if (server.getState().updateStatemachine(majority, currentTerm)) {
         watchRequests.update(ReplicationLevel.MAJORITY, majority);
+        logMetadata(majority);
         commitIndexChanged();
       }
       checkAndUpdateConfiguration(entriesToCommit);
     }
 
     watchRequests.update(ReplicationLevel.ALL, min);
-    pendingRequests.checkDelayedReplies(min);
+  }
+
+  private void logMetadata(long commitIndex) {
+    raftLog.appendMetadata(currentTerm, commitIndex);
+    notifySenders();
   }
 
   private boolean committedConf(TermIndex[] entries) {
@@ -605,11 +656,8 @@ public class LeaderState {
     notifySenders();
   }
 
-  static long getMajority(long[] indices) {
-    return indices[(indices.length - 1) / 2];
-  }
-
-  private long[] getSortedLogIndices(List<FollowerInfo> followers, boolean includeSelf) {
+  private static long[] getSorted(List<FollowerInfo> followers, boolean includeSelf,
+      ToLongFunction<FollowerInfo> getFollowerIndex, LongSupplier getLogIndex) {
     final int length = includeSelf ? followers.size() + 1 : followers.size();
     if (length == 0) {
       throw new IllegalArgumentException("followers.size() == "
@@ -617,11 +665,11 @@ public class LeaderState {
     }
     final long[] indices = new long[length];
     for (int i = 0; i < followers.size(); i++) {
-      indices[i] = followers.get(i).getMatchIndex();
+      indices[i] = getFollowerIndex.applyAsLong(followers.get(i));
     }
     if (includeSelf) {
       // note that we also need to wait for the local disk I/O
-      indices[length - 1] = raftLog.getLatestFlushedIndex();
+      indices[length - 1] = getLogIndex.getAsLong();
     }
 
     Arrays.sort(indices);
@@ -645,13 +693,8 @@ public class LeaderState {
     return lists;
   }
 
-  /** @return true if the request is replied; otherwise, the reply is delayed, return false. */
-  boolean replyPendingRequest(long logIndex, RaftClientReply reply, RetryCache.CacheEntry cacheEntry) {
-    if (!pendingRequests.replyPendingRequest(logIndex, reply, cacheEntry)) {
-      submitUpdateCommitEvent();
-      return false;
-    }
-    return true;
+  void replyPendingRequest(long logIndex, RaftClientReply reply) {
+    pendingRequests.replyPendingRequest(logIndex, reply);
   }
 
   TransactionContext getTransactionContext(long index) {
